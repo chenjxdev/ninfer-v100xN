@@ -704,7 +704,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     }
     sequence.retained = false;
     sequence.archived_snapshot.reset();
-    sequence.history_enabled = request_plan.capture_prefix_checkpoints;
+    // Lane-local Vision checkpoints are retained in-sequence; do not archive Vision
+    // into the Text historical host-KV branch budget.
+    sequence.history_enabled =
+        request_plan.capture_prefix_checkpoints && !prompt.has_media();
     sequence.shared_prefix_tokens = std::min(sequence.shared_prefix_tokens, base);
     if (base == 0) { sequence.prefix_chunks.clear(); }
     try {
@@ -2776,7 +2779,12 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (staged.capture_prefix_checkpoints) {
                 const auto images = kPrefixCheckpointBudget / max_concurrency / prefix_checkpoint_bytes();
                 const auto segments = std::max<std::size_t>(1, images - 1);
-                const auto span = (staged.prompt_tokens + segments - 1) / segments;
+                // Prefer denser anchors when the 2 GiB image budget allows; never space
+                // captures farther apart than 16384 tokens (Strata prompt-cache-every default).
+                constexpr std::uint32_t kMaxCheckpointSpan = 16384;
+                const auto span = std::min<std::uint64_t>(
+                    kMaxCheckpointSpan,
+                    (staged.prompt_tokens + segments - 1) / segments);
                 checkpoint_interval = ((span + quantum - 1) / quantum) * quantum;
                 if (images > 1) {
                     // One early state covers short common prefixes. Subsequent captures

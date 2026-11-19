@@ -848,8 +848,7 @@ budget-spaced actual prefill chunk ends and the final prompt boundary. The early
 the ordinary chunk grid; not every small GPU chunk is copied to RAM. Under the budget, older
 redundant images are evicted, preserving a first and recent checkpoint when two images fit.
 Capture/restore transfer time is included
-in prefill timing. `--no-prefix-reuse` also skips these captures. Vision, DFlash and sparse RAM-KV
-keep the existing frontier/turn/response rules and do not archive historical branches.
+in prefill timing. `--no-prefix-reuse` also skips these captures. Vision, DFlash and sparse RAM-KV keep the existing frontier/turn/response rules and do not archive historical branches. Vision Text/MTP may still retain lane-local GDN/tail prefix images for `restore_prefix_checkpoint` within the active lane; sticky degraded image caps keep append-only media token lengths stable across turns.
 See [prefix state ownership](maintainer/paged-kv-cache.md#10-prefix-reuse).
 
 The shared family runtime distinguishes `full_reset`, `append_frontier`,
