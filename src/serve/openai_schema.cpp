@@ -565,6 +565,32 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     }
     parse_openai_reasoning_effort(body, out);
     out.preserve_thinking = parse_openai_preserve_thinking(body);
+    if (body.contains("ninfer_prefix_pin") && !body.at("ninfer_prefix_pin").is_null()) {
+        const Json& pin = body.at("ninfer_prefix_pin");
+        if (!pin.is_object()) {
+            bad_request("ninfer_prefix_pin must be an object", "ninfer_prefix_pin");
+        }
+        bool any = false;
+        if (pin.contains("tokens") && !pin.at("tokens").is_null()) {
+            if (!pin.at("tokens").is_number_integer() || pin.at("tokens").get<int>() <= 0) {
+                bad_request("ninfer_prefix_pin.tokens must be a positive integer",
+                            "ninfer_prefix_pin");
+            }
+            out.prefix_pin_tokens = static_cast<std::uint32_t>(pin.at("tokens").get<int>());
+            any = true;
+        }
+        if (pin.contains("messages") && !pin.at("messages").is_null()) {
+            if (!pin.at("messages").is_number_integer() || pin.at("messages").get<int>() <= 0) {
+                bad_request("ninfer_prefix_pin.messages must be a positive integer",
+                            "ninfer_prefix_pin");
+            }
+            out.prefix_pin_messages = static_cast<std::uint32_t>(pin.at("messages").get<int>());
+            any = true;
+        }
+        if (!any) {
+            bad_request("ninfer_prefix_pin requires tokens and/or messages", "ninfer_prefix_pin");
+        }
+    }
 
     std::optional<int> max_tokens = get_int(body, "max_completion_tokens");
     if (!max_tokens) { max_tokens = get_int(body, "max_tokens"); }

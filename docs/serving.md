@@ -127,6 +127,8 @@ resident frontier or saved turn/response checkpoint reuses its complete model st
 the suffix; an exact hit requires no prompt-token prefill. See the cache behavior below for matching
 and retention rules. `--no-prefix-reuse` forces cold requests for comparison.
 
+Optional request field `ninfer_prefix_pin` pins an exact reusable frontier so later questions that keep that prefix only prefill the suffix: `{"ninfer_prefix_pin":{"messages":1}}` or `{"ninfer_prefix_pin":{"tokens":N}}`. Pinned lane/archive checkpoints are preferred under eviction pressure.
+
 ```bash
 ./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
   --tp 2 --devices 0,1 \

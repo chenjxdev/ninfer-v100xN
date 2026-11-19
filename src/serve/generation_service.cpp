@@ -455,6 +455,16 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
             .deadline     = prepared.lifetime->deadline,
             .cancellation = CancellationView(is_cancelled),
         };
+        if (request.prefix_pin_messages && *request.prefix_pin_messages > 0 &&
+            request_options.execution.prefix_pin_tokens == 0) {
+            ninfer::PromptInput pin_input = input;
+            const std::size_t keep = std::min<std::size_t>(*request.prefix_pin_messages,
+                                                           pin_input.messages.size());
+            pin_input.messages.resize(keep);
+            pin_input.options.add_generation_prompt = false;
+            const std::uint32_t pinned = engine_->count_tokens(std::move(pin_input), control);
+            if (pinned != 0) { request_options.execution.prefix_pin_tokens = pinned; }
+        }
         ninfer::PreparedPrompt prompt = engine_->prepare(std::move(input), control);
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
