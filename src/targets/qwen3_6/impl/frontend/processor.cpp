@@ -290,8 +290,7 @@ struct MediaPlan {
 
 constexpr std::string_view kOmittedImageNote = "[image omitted: too many images for the context]";
 constexpr std::uint64_t kOmittedNoteSlackTokens = 2;
-constexpr std::uint64_t kLowWaterNumerator      = 3;
-constexpr std::uint64_t kLowWaterDenominator    = 5;
+// Append-stable shrink no longer stops at a low-water mark; kept comments for provenance.
 
 ProcessorOptions capped_image_options(const ProcessorOptions& options, std::uint64_t max_pixels) {
     ProcessorOptions out = options;
@@ -320,6 +319,10 @@ std::pair<int, int> probe_image_extent(const ChatPart& part, MediaPreprocessCach
 MediaPlan plan_media_budget(std::span<ChatPart* const> parts, const ProcessorOptions& options,
                             const media::decode::Policy& policy, std::uint64_t budget_tokens,
                             const Tokenizer& tokenizer, MediaPreprocessCache& cache) {
+    // Append-stable policy: once over budget, put every image at the degraded floor (including
+    // the newest). A later request that only appends images therefore never changes an earlier
+    // image's token length, so the Engine can AppendAtFrontier under Vision (which does not
+    // capture RAM prefix checkpoints). Sticky caps in the media cache prevent unshrinking.
     MediaPlan plan;
     plan.image_max_pixels.assign(parts.size(), 0);
     plan.dropped.assign(parts.size(), false);
@@ -328,44 +331,62 @@ MediaPlan plan_media_budget(std::span<ChatPart* const> parts, const ProcessorOpt
 
     std::vector<std::uint64_t> current(parts.size(), 0);
     std::vector<std::uint64_t> floor(parts.size(), 0);
+    std::vector<std::array<std::uint8_t, 32>> digests(parts.size());
     std::uint64_t total = 0;
     for (std::size_t i = 0; i < parts.size(); ++i) {
         const ChatPart& part = *parts[i];
         if (part.kind != ChatPartKind::Image) { continue; }
+        digests[i] = sha256(part.media.bytes, policy.checkpoint);
         const auto [width, height] = probe_image_extent(part, cache, policy);
         current[i] = item_vision_tokens(image_item_for_extent(height, width, options));
         floor[i]   = std::min(current[i], item_vision_tokens(image_item_for_extent(
                                               height, width, degraded_options)));
+        if (const auto sticky = cache.image_pixel_cap(digests[i])) {
+            if (*sticky == 0) {
+                // Previously omitted: treat as note-cost placeholder until apply drops it.
+                plan.dropped[i] = true;
+                ++plan.omitted;
+                current[i] = 0;
+            } else if (*sticky < options.image_max_pixels && current[i] > floor[i]) {
+                current[i] = floor[i];
+                plan.image_max_pixels[i] = options.degraded_image_max_pixels;
+                ++plan.degraded;
+            }
+        }
         total += current[i];
     }
-    // Videos are not shrunk here. If images alone fit, skip scanning videos during planning.
-    if (total <= budget_tokens) { return plan; }
+    if (total <= budget_tokens) {
+        // Persist sticky caps so a later under-budget view cannot unshrink and break reuse.
+        for (std::size_t i = 0; i < parts.size(); ++i) {
+            if (parts[i]->kind != ChatPartKind::Image) { continue; }
+            if (plan.dropped[i]) {
+                cache.remember_image_pixel_cap(digests[i], 0);
+            } else if (plan.image_max_pixels[i] != 0) {
+                cache.remember_image_pixel_cap(digests[i], plan.image_max_pixels[i]);
+            }
+        }
+        return plan;
+    }
 
-    const std::uint64_t low_water = budget_tokens / kLowWaterDenominator * kLowWaterNumerator;
     const auto shrink = [&](std::size_t i) {
+        if (parts[i]->kind != ChatPartKind::Image || plan.dropped[i]) { return; }
         if (floor[i] >= current[i]) { return; }
         total -= current[i] - floor[i];
         current[i] = floor[i];
+        if (plan.image_max_pixels[i] == 0) { ++plan.degraded; }
         plan.image_max_pixels[i] = options.degraded_image_max_pixels;
-        ++plan.degraded;
+        cache.remember_image_pixel_cap(digests[i], options.degraded_image_max_pixels);
     };
-    std::size_t newest_image = parts.size();
-    for (std::size_t i = parts.size(); i-- > 0;) {
-        if (parts[i]->kind == ChatPartKind::Image) {
-            newest_image = i;
-            break;
-        }
-    }
-    for (std::size_t i = 0; i < parts.size() && total > low_water; ++i) {
-        if (i != newest_image) { shrink(i); }
-    }
-    if (total > budget_tokens && newest_image < parts.size()) { shrink(newest_image); }
+    // Shrink every remaining image to the floor in one pass (append-stable).
+    for (std::size_t i = 0; i < parts.size(); ++i) { shrink(i); }
 
     const std::uint64_t note_tokens =
         total > budget_tokens ? tokenizer.encode(kOmittedImageNote).size() + kOmittedNoteSlackTokens
                               : 0;
     for (std::size_t i = 0; i < parts.size() && total > budget_tokens; ++i) {
-        if (parts[i]->kind != ChatPartKind::Image || current[i] <= note_tokens) { continue; }
+        if (parts[i]->kind != ChatPartKind::Image || plan.dropped[i] || current[i] <= note_tokens) {
+            continue;
+        }
         total -= current[i] - note_tokens;
         current[i] = note_tokens;
         plan.dropped[i] = true;
@@ -374,6 +395,7 @@ MediaPlan plan_media_budget(std::span<ChatPart* const> parts, const ProcessorOpt
             --plan.degraded;
         }
         ++plan.omitted;
+        cache.remember_image_pixel_cap(digests[i], 0);
     }
     return plan;
 }

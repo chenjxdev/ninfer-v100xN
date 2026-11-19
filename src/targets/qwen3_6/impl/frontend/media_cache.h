@@ -122,6 +122,12 @@ public:
     void remember_image_extent(const std::array<std::uint8_t, 32>& digest, int width,
                                int height) const;
 
+    // Sticky Vision degrade decisions keyed by content digest. 0 means omitted.
+    [[nodiscard]] std::optional<std::uint64_t>
+    image_pixel_cap(const std::array<std::uint8_t, 32>& digest) const;
+    void remember_image_pixel_cap(const std::array<std::uint8_t, 32>& digest,
+                                  std::uint64_t max_pixels) const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
