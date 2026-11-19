@@ -134,7 +134,7 @@ struct EngineOptions {
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
-    std::uint32_t prefill_chunk        = 1024;
+    std::uint32_t prefill_chunk        = 2048;
     // Decode rounds between bounded prefill steps when both phases are runnable (1..64).
     // More rounds favor active streams at the cost of the prefilling request's TTFT.
     std::uint32_t prefill_decode_rounds = 1;
@@ -231,6 +231,8 @@ struct ExecutionOptions {
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    // Exact token frontier to pin as a never-evict prefix checkpoint (0 = none).
+    std::uint32_t prefix_pin_tokens = 0;
 };
 
 struct OutputOptions {
@@ -366,6 +368,8 @@ struct PromptPreparationStats {
     double media_preprocess_work_seconds = 0.0;
     double tokenize_seconds              = 0.0;
     std::size_t media_items              = 0;
+    std::size_t degraded_media_items     = 0;
+    std::size_t dropped_media_items      = 0;
     std::size_t media_bytes              = 0;
     std::uint64_t raw_patches            = 0;
     std::uint64_t vision_tokens          = 0;

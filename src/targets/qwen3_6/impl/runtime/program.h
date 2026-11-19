@@ -74,6 +74,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
     bool allow_prefix_reuse = false;
     bool capture_prefix_checkpoints = false;
+    std::uint32_t prefix_pin_tokens = 0;
 };
 
 template <>
@@ -86,6 +87,7 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     std::shared_ptr<const NINFER_QWEN36_RUNTIME_NS::ArchivedPrefix> archived_prefix;
     bool prepare_mtp = false;
     bool capture_prefix_checkpoints = false;
+    std::uint32_t prefix_pin_tokens = 0;
     std::optional<NINFER_QWEN36_RUNTIME_NS::VisionPrefillPlan> vision;
     NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction rewrite_checkpoint_action =
         NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction::Drop;
@@ -133,6 +135,7 @@ struct RewriteCheckpoint {
 
 struct PrefixCheckpoint {
     std::uint32_t frontier = 0;
+    bool pinned = false;
     // All ranks' exact convolution/recurrent state followed by rank 0's tail hidden.
     std::shared_ptr<std::byte[]> image;
 };
@@ -178,6 +181,7 @@ struct PrefixHostPools {
 struct ArchivedPrefix {
     std::uint32_t frontier = 0;
     std::uint32_t mtp_valid = 0;
+    bool pinned = false;
     std::vector<TokenId> ledger;
     qwen3_6::detail::ResidentPrefixIdentity identity;
     std::vector<PrefixCheckpoint> checkpoints;
@@ -276,6 +280,7 @@ struct RequestControl {
         double elapsed_seconds           = 0.0;
         bool prepare_mtp                 = false;
         bool capture_prefix_checkpoints  = false;
+        std::uint32_t prefix_pin_tokens  = 0;
         ReusePath reuse                  = ReusePath::FullReset;
         MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
     };
@@ -578,6 +583,7 @@ private:
     void refresh_ram_kv(SequenceState& sequence, std::uint32_t frontier);
     [[nodiscard]] std::size_t prefix_checkpoint_bytes() const;
     void save_prefix_checkpoint(SequenceState& sequence, std::uint32_t frontier, const Tensor& hidden);
+    void mark_prefix_checkpoint_pinned(SequenceState& sequence, std::uint32_t frontier);
     PrefixCheckpoint capture_prefix_checkpoint(SequenceState& sequence, std::uint32_t frontier,
                                                 const Tensor& hidden,
                                                 std::shared_ptr<std::byte[]> image = {});

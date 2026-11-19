@@ -23,6 +23,7 @@ struct ResolvedExecutionOptions {
     ResolvedSamplingParameters sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    std::uint32_t prefix_pin_tokens       = 0;
 };
 
 struct ResolvedRequestOptions {

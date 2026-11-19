@@ -26,7 +26,8 @@ struct KeyHash {
         for (std::uint8_t byte : key.digest) {
             value ^= static_cast<std::size_t>(byte) + 0x9e3779b9U + (value << 6U) + (value >> 2U);
         }
-        return value ^ static_cast<std::size_t>(key.modality);
+        return value ^ static_cast<std::size_t>(key.modality) ^
+               std::hash<std::uint64_t>{}(key.max_pixels);
     }
 };
 
@@ -227,6 +228,11 @@ struct MediaPreprocessCache::Impl {
             });
     }
 
+    static constexpr std::size_t kMaximumRememberedExtents = 8192;
+    mutable std::mutex extent_mutex;
+    std::unordered_map<std::string, std::pair<int, int>> extents;
+    std::unordered_map<std::string, std::uint64_t> pixel_caps;
+
     const std::uint32_t threads;
     std::shared_ptr<State> state;
     std::shared_ptr<MediaPreparationGate> request_gate;
@@ -241,6 +247,40 @@ MediaPreprocessCache::MediaPreprocessCache(std::size_t capacity_bytes,
                                    maximum_request_bytes)) {}
 
 MediaPreprocessCache::~MediaPreprocessCache() = default;
+
+std::optional<std::pair<int, int>>
+MediaPreprocessCache::image_extent(const std::array<std::uint8_t, 32>& digest) const {
+    const std::string key(digest.begin(), digest.end());
+    std::lock_guard lock(impl_->extent_mutex);
+    const auto found = impl_->extents.find(key);
+    if (found == impl_->extents.end()) { return std::nullopt; }
+    return found->second;
+}
+
+void MediaPreprocessCache::remember_image_extent(const std::array<std::uint8_t, 32>& digest,
+                                                 int width, int height) const {
+    std::lock_guard lock(impl_->extent_mutex);
+    if (impl_->extents.size() >= Impl::kMaximumRememberedExtents) { impl_->extents.clear(); }
+    impl_->extents.emplace(std::string(digest.begin(), digest.end()), std::pair{width, height});
+}
+
+std::optional<std::uint64_t>
+MediaPreprocessCache::image_pixel_cap(const std::array<std::uint8_t, 32>& digest) const {
+    const std::string key(digest.begin(), digest.end());
+    std::lock_guard lock(impl_->extent_mutex);
+    const auto found = impl_->pixel_caps.find(key);
+    if (found == impl_->pixel_caps.end()) { return std::nullopt; }
+    return found->second;
+}
+
+void MediaPreprocessCache::remember_image_pixel_cap(const std::array<std::uint8_t, 32>& digest,
+                                                    std::uint64_t max_pixels) const {
+    std::lock_guard lock(impl_->extent_mutex);
+    if (impl_->pixel_caps.size() >= Impl::kMaximumRememberedExtents) { impl_->pixel_caps.clear(); }
+    impl_->pixel_caps[std::string(digest.begin(), digest.end())] = max_pixels;
+}
+
+
 
 std::shared_ptr<qwen3_6::PreparedMediaPayload>
 MediaPreprocessCache::allocate_payload(std::size_t elements, const PreparationControl& control) {

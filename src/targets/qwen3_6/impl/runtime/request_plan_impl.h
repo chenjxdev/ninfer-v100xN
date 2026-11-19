@@ -106,10 +106,20 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->summary.transient_bytes        = 0;
     base->sampling                       = translate_sampling(options.sampling);
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
+    // Vision may capture lane-local GDN/tail images so mid-history edits can
+    // RestorePrefixCheckpoint. Historical host KV archive stays Text-only
+    // (see history_enabled at admit). Sticky media floors keep append-stable tokens.
     base->capture_prefix_checkpoints = options.allow_prefix_reuse && prompt.identity.reusable &&
-        !prompt.has_media() && ram_kv.gpu_tokens == 0 &&
+        ram_kv.gpu_tokens == 0 &&
         speculative_backend != SpeculativeBackend::DFlash &&
         prefix_checkpoint_bytes() <= kPrefixCheckpointBudget / max_concurrency;
+    if (options.prefix_pin_tokens != 0) {
+        if (options.prefix_pin_tokens >= base->summary.prompt_tokens) {
+            throw std::invalid_argument(
+                "prefix_pin_tokens must lie strictly inside the prompt frontier");
+        }
+        base->prefix_pin_tokens = options.prefix_pin_tokens;
+    }
     const std::uint32_t reserved_context_tokens =
         base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
                                            ? 0U
@@ -202,6 +212,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
     plan->capture_prefix_checkpoints = base.capture_prefix_checkpoints;
+    plan->prefix_pin_tokens = base.prefix_pin_tokens;
 
     if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained) {
         const bool dflash_append_ready =
@@ -222,8 +233,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
         // A shorter/edited prompt can still claim any retained complete state image.
         // Prefer the longest matching frontier, not the checkpoint's original purpose.
-        if (!prompt.has_media() && ram_kv.gpu_tokens == 0 &&
-            speculative_backend != SpeculativeBackend::DFlash) {
+        // Vision is included for lane-local images; historical sibling archive stays Text-only.
+        if (ram_kv.gpu_tokens == 0 && speculative_backend != SpeculativeBackend::DFlash) {
             for (const auto& checkpoint : sequence.prefix_checkpoints) {
                 if (checkpoint.frontier > plan->reuse_base &&
                     qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
@@ -235,7 +246,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
     }
 
-    if (base.capture_prefix_checkpoints && prefix_cache_tokens != 0) {
+    if (base.capture_prefix_checkpoints && !prompt.has_media() && prefix_cache_tokens != 0) {
         // A completed sibling lane can seed a private continuation without sharing
         // writable GPU pages. Archive only a sibling that improves this plan.
         for (auto& sibling : sequences) {

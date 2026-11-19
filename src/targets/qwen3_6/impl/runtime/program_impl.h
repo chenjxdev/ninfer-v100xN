@@ -704,7 +704,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     }
     sequence.retained = false;
     sequence.archived_snapshot.reset();
-    sequence.history_enabled = request_plan.capture_prefix_checkpoints;
+    // Lane-local Vision checkpoints are retained in-sequence; do not archive Vision
+    // into the Text historical host-KV branch budget.
+    sequence.history_enabled =
+        request_plan.capture_prefix_checkpoints && !prompt.has_media();
     sequence.shared_prefix_tokens = std::min(sequence.shared_prefix_tokens, base);
     if (base == 0) { sequence.prefix_chunks.clear(); }
     try {
@@ -914,6 +917,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .elapsed_seconds            = 0.0,
             .prepare_mtp                = request_plan.prepare_mtp,
             .capture_prefix_checkpoints = request_plan.capture_prefix_checkpoints,
+            .prefix_pin_tokens = request_plan.prefix_pin_tokens,
             .reuse                      = request_plan.reuse,
             .mtp_bridge                 = request_plan.mtp_bridge,
         };
@@ -1228,20 +1232,41 @@ void ProgramImplCore::save_prefix_checkpoint(SequenceState& sequence, std::uint3
     } else if (checkpoints.size() >= limit) {
         // Keep the first image and spread the remaining images over the history.
         // Recycle the most redundant interior image, including the incoming endpoint.
+        // Never evict a pinned shared-prefix image while an unpinned victim exists.
         std::size_t victim = 0;
         if (limit > 1) {
             victim = 1;
             std::uint32_t closest = std::numeric_limits<std::uint32_t>::max();
+            bool found_unpinned = false;
             for (std::size_t i = 1; i < checkpoints.size(); ++i) {
+                if (checkpoints[i].pinned) { continue; }
                 const auto right = i + 1 < checkpoints.size() ? checkpoints[i + 1].frontier : frontier;
                 const auto span = right - checkpoints[i - 1].frontier;
-                if (span < closest) { closest = span; victim = i; }
+                if (!found_unpinned || span < closest) {
+                    closest = span;
+                    victim = i;
+                    found_unpinned = true;
+                }
             }
+            if (!found_unpinned) {
+                for (std::size_t i = 0; i < checkpoints.size(); ++i) {
+                    if (!checkpoints[i].pinned) { victim = i; found_unpinned = true; break; }
+                }
+                if (!found_unpinned) { return; }
+            }
+        } else if (checkpoints[0].pinned) {
+            return;
         }
         checkpoint.image = std::move(checkpoints[victim].image);
         checkpoints.erase(checkpoints.begin() + static_cast<std::ptrdiff_t>(victim));
     }
     checkpoints.push_back(capture_prefix_checkpoint(sequence, frontier, hidden, std::move(checkpoint.image)));
+}
+
+void ProgramImplCore::mark_prefix_checkpoint_pinned(SequenceState& sequence, std::uint32_t frontier) {
+    for (auto& entry : sequence.prefix_checkpoints) {
+        entry.pinned = entry.frontier == frontier;
+    }
 }
 
 PrefixCheckpoint ProgramImplCore::capture_prefix_checkpoint(SequenceState& sequence,
@@ -1373,7 +1398,12 @@ void ProgramImplCore::trim_prefix_history() {
             }
             if (removed) { continue; }
         }
-        prefix_history.erase(prefix_history.begin()); // FIFO oldest branch, including its private suffix.
+        // Prefer FIFO among unpinned branches so a pinned document root survives longer.
+        auto victim = prefix_history.begin();
+        for (auto it = prefix_history.begin(); it != prefix_history.end(); ++it) {
+            if (!(*it)->pinned) { victim = it; break; }
+        }
+        prefix_history.erase(victim);
         for (auto& sequence : sequences) {
             sequence.prefix_chunks.clear();
             sequence.shared_prefix_tokens = 0;
@@ -1411,6 +1441,8 @@ void ProgramImplCore::archive_prefix(SequenceState& sequence) {
     archive->ledger.assign(sequence.ledger.begin(), sequence.ledger.begin() + frontier);
     archive->identity = sequence.prefix_identity;
     archive->checkpoints = std::move(saved_checkpoints);
+    archive->pinned = std::any_of(archive->checkpoints.begin(), archive->checkpoints.end(),
+                                  [](const auto& checkpoint) { return checkpoint.pinned; });
     std::sort(archive->checkpoints.begin(), archive->checkpoints.end(),
               [](const auto& a, const auto& b) { return a.frontier < b.frontier; });
     const auto backend_pages = prefix_page_count(archive->mtp_valid);
@@ -2776,7 +2808,12 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (staged.capture_prefix_checkpoints) {
                 const auto images = kPrefixCheckpointBudget / max_concurrency / prefix_checkpoint_bytes();
                 const auto segments = std::max<std::size_t>(1, images - 1);
-                const auto span = (staged.prompt_tokens + segments - 1) / segments;
+                // Prefer denser anchors when the 2 GiB image budget allows; never space
+                // captures farther apart than 16384 tokens (Strata prompt-cache-every default).
+                constexpr std::uint32_t kMaxCheckpointSpan = 16384;
+                const auto span = std::min<std::uint64_t>(
+                    kMaxCheckpointSpan,
+                    (staged.prompt_tokens + segments - 1) / segments);
                 checkpoint_interval = ((span + quantum - 1) / quantum) * quantum;
                 if (images > 1) {
                     // One early state covers short common prefixes. Subsequent captures
@@ -2789,6 +2826,10 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                         nominal = std::min(nominal, quantum - staged.cursor % quantum);
                     }
                 }
+            }
+            if (staged.prefix_pin_tokens != 0 && staged.cursor < staged.prefix_pin_tokens &&
+                staged.cursor + nominal > staged.prefix_pin_tokens) {
+                nominal = staged.prefix_pin_tokens - staged.cursor;
             }
             const bool final_candidate = staged.cursor + nominal == staged.prompt_tokens;
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
@@ -2848,10 +2889,14 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             }
             if (staged.capture_prefix_checkpoints &&
                 (staged.cursor == early_frontier || staged.cursor == staged.prompt_tokens ||
+                 staged.cursor == staged.prefix_pin_tokens ||
                  staged.cursor / checkpoint_interval !=
                      (staged.cursor - result.processed_tokens) / checkpoint_interval)) {
                 save_prefix_checkpoint(sequence, staged.cursor,
                     prefill_hidden.slice(1, static_cast<std::int32_t>(result.tail_column), 1));
+                if (staged.prefix_pin_tokens != 0 && staged.cursor == staged.prefix_pin_tokens) {
+                    mark_prefix_checkpoint_pinned(sequence, staged.prefix_pin_tokens);
+                }
             }
 
             if (!result.finalized) {

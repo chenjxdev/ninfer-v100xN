@@ -10,11 +10,13 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <cstddef>
 #include <cstdint>
 #include <iomanip>
 #include <limits>
 #include <mutex>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -263,6 +265,162 @@ void append_patch(const std::vector<const media::decode::Image*>& frames, int gr
 
 void add_budget(PreprocessStats& stats, const VisionItem& item);
 void enforce_media_resource_limits(const PreprocessStats& stats, const ProcessorOptions& options);
+
+VisionItem image_item_for_extent(int height, int width, const ProcessorOptions& options) {
+    const Size size = smart_resize_image(height, width, options.image_min_pixels,
+                                         options.image_max_pixels);
+    VisionItem item;
+    item.modality = Modality::Image;
+    item.grid     = {1, size.h / kPatch, size.w / kPatch};
+    return item;
+}
+
+// Request-level vision budget. Agent loops re-send every earlier screenshot, so the sum outgrows
+// the budget even when each image is fine. Shrink the oldest images to a small ceiling first; if
+// that is not enough, replace the oldest with a text note. Decisions depend only on order/size so
+// appending one image keeps earlier decisions and the prompt prefix stays reusable.
+struct MediaPlan {
+    std::vector<std::uint64_t> image_max_pixels;
+    std::vector<bool> dropped;
+    std::size_t degraded = 0;
+    std::size_t omitted  = 0;
+
+    [[nodiscard]] bool changed() const noexcept { return degraded != 0 || omitted != 0; }
+};
+
+constexpr std::string_view kOmittedImageNote = "[image omitted: too many images for the context]";
+constexpr std::uint64_t kOmittedNoteSlackTokens = 2;
+// Append-stable shrink no longer stops at a low-water mark; kept comments for provenance.
+
+ProcessorOptions capped_image_options(const ProcessorOptions& options, std::uint64_t max_pixels) {
+    ProcessorOptions out = options;
+    if (max_pixels != 0) {
+        out.image_max_pixels = std::min(out.image_max_pixels, max_pixels);
+        out.image_min_pixels = std::min(out.image_min_pixels, out.image_max_pixels);
+    }
+    return out;
+}
+
+std::uint64_t item_vision_tokens(const VisionItem& item) {
+    return static_cast<std::uint64_t>(item.grid.t) * static_cast<std::uint64_t>(item.grid.h) *
+           static_cast<std::uint64_t>(item.grid.w) / (kMerge * kMerge);
+}
+
+std::pair<int, int> probe_image_extent(const ChatPart& part, MediaPreprocessCache& cache,
+                                       const media::decode::Policy& policy) {
+    const auto digest = sha256(part.media.bytes, policy.checkpoint);
+    if (const auto known = cache.image_extent(digest)) { return *known; }
+    // coder390 decode has no inspect_image; decode once for dimensions and memoize.
+    const media::decode::Image image = media::decode::decode_image(part.media.bytes, policy);
+    cache.remember_image_extent(digest, image.width, image.height);
+    return {image.width, image.height};
+}
+
+MediaPlan plan_media_budget(std::span<ChatPart* const> parts, const ProcessorOptions& options,
+                            const media::decode::Policy& policy, std::uint64_t budget_tokens,
+                            const Tokenizer& tokenizer, MediaPreprocessCache& cache) {
+    // Append-stable policy: once over budget, put every image at the degraded floor (including
+    // the newest). A later request that only appends images therefore never changes an earlier
+    // image's token length, so the Engine can AppendAtFrontier under Vision (which does not
+    // capture RAM prefix checkpoints). Sticky caps in the media cache prevent unshrinking.
+    MediaPlan plan;
+    plan.image_max_pixels.assign(parts.size(), 0);
+    plan.dropped.assign(parts.size(), false);
+    const ProcessorOptions degraded_options =
+        capped_image_options(options, options.degraded_image_max_pixels);
+
+    std::vector<std::uint64_t> current(parts.size(), 0);
+    std::vector<std::uint64_t> floor(parts.size(), 0);
+    std::vector<std::array<std::uint8_t, 32>> digests(parts.size());
+    std::uint64_t total = 0;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        const ChatPart& part = *parts[i];
+        if (part.kind != ChatPartKind::Image) { continue; }
+        digests[i] = sha256(part.media.bytes, policy.checkpoint);
+        const auto [width, height] = probe_image_extent(part, cache, policy);
+        current[i] = item_vision_tokens(image_item_for_extent(height, width, options));
+        floor[i]   = std::min(current[i], item_vision_tokens(image_item_for_extent(
+                                              height, width, degraded_options)));
+        if (const auto sticky = cache.image_pixel_cap(digests[i])) {
+            if (*sticky == 0) {
+                // Previously omitted: treat as note-cost placeholder until apply drops it.
+                plan.dropped[i] = true;
+                ++plan.omitted;
+                current[i] = 0;
+            } else if (*sticky < options.image_max_pixels && current[i] > floor[i]) {
+                current[i] = floor[i];
+                plan.image_max_pixels[i] = options.degraded_image_max_pixels;
+                ++plan.degraded;
+            }
+        }
+        total += current[i];
+    }
+    if (total <= budget_tokens) {
+        // Persist sticky caps so a later under-budget view cannot unshrink and break reuse.
+        for (std::size_t i = 0; i < parts.size(); ++i) {
+            if (parts[i]->kind != ChatPartKind::Image) { continue; }
+            if (plan.dropped[i]) {
+                cache.remember_image_pixel_cap(digests[i], 0);
+            } else if (plan.image_max_pixels[i] != 0) {
+                cache.remember_image_pixel_cap(digests[i], plan.image_max_pixels[i]);
+            }
+        }
+        return plan;
+    }
+
+    const auto shrink = [&](std::size_t i) {
+        if (parts[i]->kind != ChatPartKind::Image || plan.dropped[i]) { return; }
+        if (floor[i] >= current[i]) { return; }
+        total -= current[i] - floor[i];
+        current[i] = floor[i];
+        if (plan.image_max_pixels[i] == 0) { ++plan.degraded; }
+        plan.image_max_pixels[i] = options.degraded_image_max_pixels;
+        cache.remember_image_pixel_cap(digests[i], options.degraded_image_max_pixels);
+    };
+    // Shrink every remaining image to the floor in one pass (append-stable).
+    for (std::size_t i = 0; i < parts.size(); ++i) { shrink(i); }
+
+    const std::uint64_t note_tokens =
+        total > budget_tokens ? tokenizer.encode(kOmittedImageNote).size() + kOmittedNoteSlackTokens
+                              : 0;
+    for (std::size_t i = 0; i < parts.size() && total > budget_tokens; ++i) {
+        if (parts[i]->kind != ChatPartKind::Image || plan.dropped[i] || current[i] <= note_tokens) {
+            continue;
+        }
+        total -= current[i] - note_tokens;
+        current[i] = note_tokens;
+        plan.dropped[i] = true;
+        if (plan.image_max_pixels[i] != 0) {
+            plan.image_max_pixels[i] = 0;
+            --plan.degraded;
+        }
+        ++plan.omitted;
+        cache.remember_image_pixel_cap(digests[i], 0);
+    }
+    return plan;
+}
+
+std::vector<std::uint64_t> apply_media_plan(const MediaPlan& plan,
+                                            std::span<ChatPart* const> parts) {
+    std::vector<std::uint64_t> caps;
+    caps.reserve(parts.size() - plan.omitted);
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        if (!plan.dropped[i]) {
+            caps.push_back(plan.image_max_pixels[i]);
+            continue;
+        }
+        ChatPart& part = *parts[i];
+        part.kind      = ChatPartKind::Text;
+        part.text      = std::string(kOmittedImageNote);
+        part.media     = {};
+    }
+    return caps;
+}
+
+std::uint64_t vision_budget_tokens(const ProcessorOptions& options) {
+    return std::min(options.max_vision_tokens, options.max_raw_patches / (kMerge * kMerge));
+}
+
 
 // Miss builders run concurrently. Claim their aggregate extent before allocating the retained
 // patch payload so an invalid prompt cannot fill the live-byte account and leave another worker
@@ -573,7 +731,9 @@ void validate_special_token(const Tokenizer& tokenizer, std::string_view text, i
 
 std::string PreprocessStats::summary() const {
     std::ostringstream out;
-    out << "media=" << media_items << " media_bytes=" << media_bytes << " patches=" << raw_patches
+    out << "media=" << media_items << " degraded=" << degraded_media_items
+        << " dropped=" << dropped_media_items << " media_bytes=" << media_bytes
+        << " patches=" << raw_patches
         << " vision_tokens=" << vision_tokens << " attention_pairs=" << attention_pairs
         << " prompt_tokens=" << prompt_tokens << " patch_bytes=" << patch_bytes;
     return out.str();
@@ -619,7 +779,10 @@ Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& cha
     if (options_.max_encoded_media_bytes == 0 || options_.max_decoded_pixels == 0 ||
         options_.max_decoded_video_pixels == 0 || options_.max_raw_patches == 0 ||
         options_.max_vision_tokens == 0 || options_.image_min_pixels == 0 ||
-        options_.image_max_pixels < options_.image_min_pixels || options_.video_min_pixels == 0 ||
+        options_.image_max_pixels < options_.image_min_pixels ||
+        options_.degraded_image_max_pixels == 0 ||
+        options_.degraded_image_max_pixels > options_.image_max_pixels ||
+        options_.video_min_pixels == 0 ||
         options_.video_max_pixels < options_.video_min_pixels || !(options_.video_fps > 0.0) ||
         options_.video_min_frames <= 0 || options_.video_max_frames < options_.video_min_frames ||
         options_.max_video_source_frames < options_.video_max_frames ||
@@ -635,7 +798,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
                                   ChatRenderOptions render_options,
                                   const PreparationControl& control) const {
     check_preparation_control(control);
-    const std::vector<ChatPart*> parts = media_parts(messages);
+    std::vector<ChatPart*> parts = media_parts(messages);
     const std::uint64_t maximum_items_from_extents =
         std::min(options_.max_raw_patches / kMinimumRawPatchesPerItem, options_.max_vision_tokens);
     if (std::cmp_greater(parts.size(), maximum_items_from_extents)) {
@@ -650,8 +813,48 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         }
         remaining_media_bytes -= part->media.bytes.size();
     }
-    MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
+    const ChatRenderOptions render_options_copy = render_options;
     RenderedChat rendered = chat_template_.render(messages, std::move(render_options));
+    MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
+    std::vector<std::uint64_t> image_caps(parts.size(), 0);
+    std::size_t degraded_items = 0;
+    std::size_t omitted_items  = 0;
+    {
+        const media::decode::Policy plan_policy{
+            .max_bytes                  = options_.max_encoded_media_bytes,
+            .max_decoded_pixels         = options_.max_decoded_pixels,
+            .max_decoded_video_pixels   = options_.max_decoded_video_pixels,
+            .max_video_source_frames    = options_.max_video_source_frames,
+            .max_video_duration_seconds = options_.max_video_duration_seconds,
+            .checkpoint                 = [&control] { check_preparation_control(control); },
+        };
+        try {
+            const MediaPlan plan = plan_media_budget(parts, options_, plan_policy,
+                                                     vision_budget_tokens(options_), tokenizer_,
+                                                     *media_cache_);
+            if (plan.changed()) {
+                degraded_items = plan.degraded;
+                omitted_items  = plan.omitted;
+                image_caps     = apply_media_plan(plan, parts);
+                parts          = media_parts(messages);
+                if (omitted_items != 0) {
+                    rendered = chat_template_.render(messages, render_options_copy);
+                }
+                const std::uint64_t maximum_items =
+                    std::min(options_.max_raw_patches / kMinimumRawPatchesPerItem,
+                             options_.max_vision_tokens);
+                if (std::cmp_greater(parts.size(), maximum_items)) {
+                    throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                                         "minimum Vision grids exceed processor extent budget");
+                }
+            }
+        } catch (const media::decode::Error& error) {
+            if (error.kind() == media::decode::ErrorKind::BudgetExceeded) {
+                throw ProcessorError(ProcessorErrorKind::BudgetExceeded, error.what());
+            }
+            throw;
+        }
+    }
     std::atomic<bool> stop_preparation{false};
     const PreparationControl worker_control{
         .deadline     = control.deadline,
@@ -670,30 +873,37 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     std::vector<VisionItem> items;
     items.reserve(parts.size());
     PreprocessStats stats;
-    stats.media_items = parts.size();
-    stats.media_bytes = options_.max_encoded_media_bytes - remaining_media_bytes;
+    stats.media_items          = parts.size();
+    stats.degraded_media_items = degraded_items;
+    stats.dropped_media_items  = omitted_items;
+    stats.media_bytes          = options_.max_encoded_media_bytes - remaining_media_bytes;
 
     std::vector<PendingMedia> pending_items;
     pending_items.reserve(parts.size());
     ConcurrentMediaBudget request_budget(options_);
     std::exception_ptr preparation_error;
     const auto media_phase_started = Clock::now();
-    for (ChatPart* part : parts) {
+    for (std::size_t part_index = 0; part_index < parts.size(); ++part_index) {
+        ChatPart* part = parts[part_index];
         try {
             check_preparation_control(control);
             const auto digest =
                 sha256(part->media.bytes, [&control] { check_preparation_control(control); });
             const ChatPartKind kind = part->kind;
+            const ProcessorOptions item_options =
+                capped_image_options(options_, image_caps[part_index]);
             const MediaCacheKey key{
-                .digest   = digest,
-                .modality = kind == ChatPartKind::Image ? Modality::Image : Modality::Video,
+                .digest     = digest,
+                .modality   = kind == ChatPartKind::Image ? Modality::Image : Modality::Video,
+                .max_pixels = kind == ChatPartKind::Image ? item_options.image_max_pixels : 0,
             };
             PendingMedia pending = media_cache_->begin_prepare(
                 key, worker_control,
-                [this, part, kind, digest, &policy, &request_budget, &worker_control]() {
+                [this, part, kind, digest, item_options, &policy, &request_budget,
+                 &worker_control]() {
                     Prepared built =
                         kind == ChatPartKind::Image
-                            ? prepare_image(part->media.bytes, options_, policy, *media_cache_,
+                            ? prepare_image(part->media.bytes, item_options, policy, *media_cache_,
                                             request_budget, worker_control)
                             : prepare_video(part->media.bytes, options_, policy, *media_cache_,
                                             request_budget, worker_control);

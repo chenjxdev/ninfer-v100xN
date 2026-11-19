@@ -194,6 +194,8 @@ struct GenerationRequest {
     std::string reasoning_effort_param = "reasoning_effort";
     std::optional<bool> preserve_thinking;
     bool preserve_thinking_semantic_change = false;
+    std::optional<std::uint32_t> prefix_pin_tokens;
+    std::optional<std::uint32_t> prefix_pin_messages;
     SamplingParams sampling;
 
     [[nodiscard]] bool uses_tools() const noexcept {
