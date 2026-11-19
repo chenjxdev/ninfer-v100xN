@@ -1272,7 +1272,7 @@ void ProgramImplCore::mark_prefix_checkpoint_pinned(SequenceState& sequence, std
 PrefixCheckpoint ProgramImplCore::capture_prefix_checkpoint(SequenceState& sequence,
     std::uint32_t frontier, const Tensor& hidden, std::shared_ptr<std::byte[]> image) {
     const std::size_t bytes = prefix_checkpoint_bytes();
-    PrefixCheckpoint checkpoint{frontier, std::move(image)};
+    PrefixCheckpoint checkpoint{frontier, false, std::move(image)};
     if (!checkpoint.image || checkpoint.image.use_count() != 1) {
         checkpoint.image = prefix_host_pools.checkpoint
                                ? prefix_host_pools.checkpoint->acquire(bytes)
