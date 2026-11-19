@@ -1,4 +1,29 @@
-"""Closed dual-source recipe for the Qwen3.8-27B NVFP4 artifact."""
+"""Closed single-source recipe for the Qwen3.8-27B mixed NVFP4/FP8 artifact.
+
+The quantized source is the NVIDIA ModelOpt 0.46 NVFP4 QAD checkpoint
+(``nvidia/Qwen3.8-27B-NVFP4-QAD``). ModelOpt stores each quantized Linear
+as a quad (``weight`` U8-packed [N,K/2], ``weight_scale`` F8E4M3 [N,K/16],
+``weight_scale_2`` F32 per-tensor multiplier, ``input_scale`` F32); the packed
+layout is byte-identical to the artifact's block-scale plane layout (verified
+round-trip), so every NVFP4 quad is a byte passthrough. QAD omits
+``weight_scale_2`` whenever the multiplier is exactly
+1.0, so a missing field is read as 1.0. lm_head itself is NVFP4-quantized in
+this checkpoint: the conversion reader presents its dequantized BF16 matrix
+(convert_nvfp4.QadSourceReader) for the W8 output head and the draft-head row
+gather. The export is MIXED_PRECISION: 94 attention source quads (every
+full-attention layer's q/k/v plus ten GDN layers' qkv/z, each layer's o --
+52 fused objects) are ModelOpt FP8 per-tensor quads (``weight`` F8E4M3
+[N,K], ``weight_scale`` F32 scalar, ``input_scale`` F32[1]); since v4 they
+pass through to the artifact's row-scaled FP8 storage bit-exactly on the
+code plane, with the per-tensor scalar broadcast to the per-row BF16 scale
+plane (F32->BF16 rounding is the only numerical change; the previous
+dequantize-to-BF16 + requantize-to-NVFP4 detour measured SNR 20.4 dB).
+Fused FP8 groups carry per-source scales on their own row ranges. FP8
+projections store no input_scale_divisor object. embed_tokens is BF16. The
+vision tower (333) is BF16; the QAD export ships only the 11 MTP layer
+tensors, so ``mtp.fc``, the two pre-fc norms and ``mtp.norm`` are injected
+from the auxiliary Huihui checkpoint.
+"""
 
 from __future__ import annotations
 
@@ -18,8 +43,14 @@ from . import inventory_nvfp4 as inventory
 
 BASE_REPOSITORY = "Qwen/Qwen3.8-27B"
 BASE_REVISION = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
-QUANTIZED_REPOSITORY = "unsloth/Qwen3.8-27B-NVFP4"
-QUANTIZED_REVISION = "60e813d4dbbdc5d64cf3f5a8caf2897bedf03679"
+QUANTIZED_REPOSITORY = "nvidia/Qwen3.8-27B-NVFP4-QAD"
+QUANTIZED_REVISION = "modelopt-0.46.0rc1"
+
+# ModelOpt quad field suffixes on each quantized Linear base name.
+WEIGHT = "weight"              # U8 packed [N, K/2]
+WEIGHT_SCALE = "weight_scale"  # F8_E4M3 [N, K/16]
+WEIGHT_SCALE_2 = "weight_scale_2"  # F32 scalar multiplier (QAD omits it when 1.0)
+INPUT_SCALE = "input_scale"    # F32 scalar
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,13 +83,6 @@ class MatrixPart:
 
 
 @dataclass(frozen=True, slots=True)
-class Fp8WeightRecipe:
-    object_name: str
-    shape: tuple[int, int]
-    parts: tuple[MatrixPart, ...]
-
-
-@dataclass(frozen=True, slots=True)
 class Nvfp4WeightRecipe:
     object_name: str
     shape: tuple[int, int]
@@ -71,6 +95,15 @@ class InputDivisorRecipe:
     object_name: str
     sources: tuple[MatrixSource, ...]
     weight_names: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class W8WeightRecipe:
+    """A BF16 source matrix (or fused concatenation) quantized to W8G32."""
+
+    object_name: str
+    shape: tuple[int, int]
+    parts: tuple[MatrixPart, ...]
 
 
 def _source(name: str, n: int, k: int) -> MatrixSource:
@@ -92,16 +125,14 @@ def _q_part(source: MatrixSource, gate: bool) -> MatrixPart:
     )
 
 
-def _build_quantized_matrix_recipes() -> tuple[
-    tuple[Fp8WeightRecipe, ...],
+def _build_matrix_recipes() -> tuple[
     tuple[Nvfp4WeightRecipe, ...],
     tuple[InputDivisorRecipe, ...],
-    tuple[tuple[MatrixSource, ...], ...],
+    tuple[W8WeightRecipe, ...],
 ]:
-    fp8_weights: list[Fp8WeightRecipe] = []
     nvfp4_weights: list[Nvfp4WeightRecipe] = []
     input_divisors: list[InputDivisorRecipe] = []
-    divisor_groups: list[tuple[MatrixSource, ...]] = []
+    w8_weights: list[W8WeightRecipe] = []
 
     for layer in range(64):
         source_prefix = f"model.language_model.layers.{layer}."
@@ -111,23 +142,42 @@ def _build_quantized_matrix_recipes() -> tuple[
             key = _source(source_prefix + "self_attn.k_proj", 1024, 5120)
             value = _source(source_prefix + "self_attn.v_proj", 1024, 5120)
             output = _source(source_prefix + "self_attn.o_proj", 5120, 6144)
-            fp8_weights.extend(
-                (
-                    Fp8WeightRecipe(
-                        object_prefix + "attention/query_key_gate_value",
-                        (14336, 5120),
-                        (
-                            _q_part(query, False),
-                            _all(key),
-                            _q_part(query, True),
-                            _all(value),
-                        ),
-                    ),
-                    Fp8WeightRecipe(
-                        object_prefix + "attention/output",
-                        output.shape,
-                        (_all(output),),
-                    ),
+            parts = (
+                _q_part(query, False),
+                _all(key),
+                _q_part(query, True),
+                _all(value),
+            )
+            nvfp4_weights.append(
+                Nvfp4WeightRecipe(
+                    object_prefix + "attention/query_key_gate_value",
+                    (14336, 5120),
+                    parts,
+                    (query, key, value),
+                )
+            )
+            nvfp4_weights.append(
+                Nvfp4WeightRecipe(
+                    object_prefix + "attention/output",
+                    output.shape,
+                    (_all(output),),
+                    (output,),
+                )
+            )
+            input_divisors.append(
+                InputDivisorRecipe(
+                    object_prefix
+                    + "attention/input_projection/input_scale_divisor",
+                    (query, key, value),
+                    (object_prefix + "attention/query_key_gate_value",),
+                )
+            )
+            input_divisors.append(
+                InputDivisorRecipe(
+                    object_prefix
+                    + "attention/output_projection/input_scale_divisor",
+                    (output,),
+                    (object_prefix + "attention/output",),
                 )
             )
         else:
@@ -138,89 +188,136 @@ def _build_quantized_matrix_recipes() -> tuple[
             output = _source(
                 source_prefix + "linear_attn.out_proj", 5120, 6144
             )
-            fp8_weights.extend(
-                (
-                    Fp8WeightRecipe(
-                        object_prefix + "gdn/query_key_value_z",
-                        (16384, 5120),
-                        (_all(query_key_value), _all(z)),
-                    ),
-                    Fp8WeightRecipe(
-                        object_prefix + "gdn/output",
-                        output.shape,
-                        (_all(output),),
-                    ),
+            nvfp4_weights.append(
+                Nvfp4WeightRecipe(
+                    object_prefix + "gdn/query_key_value_z",
+                    (16384, 5120),
+                    (_all(query_key_value), _all(z)),
+                    (query_key_value, z),
+                )
+            )
+            nvfp4_weights.append(
+                Nvfp4WeightRecipe(
+                    object_prefix + "gdn/output",
+                    output.shape,
+                    (_all(output),),
+                    (output,),
+                )
+            )
+            input_divisors.append(
+                InputDivisorRecipe(
+                    object_prefix
+                    + "gdn/input_projection/input_scale_divisor",
+                    (query_key_value, z),
+                    (object_prefix + "gdn/query_key_value_z",),
+                )
+            )
+            input_divisors.append(
+                InputDivisorRecipe(
+                    object_prefix
+                    + "gdn/output_projection/input_scale_divisor",
+                    (output,),
+                    (object_prefix + "gdn/output",),
                 )
             )
 
         gate = _source(source_prefix + "mlp.gate_proj", 17408, 5120)
         up = _source(source_prefix + "mlp.up_proj", 17408, 5120)
         down = _source(source_prefix + "mlp.down_proj", 5120, 17408)
-        if layer in inventory.NVFP4_MLP_LAYERS:
-            gate_up_sources = (gate, up)
-            divisor_groups.append(gate_up_sources)
-            nvfp4_weights.extend(
-                (
-                    Nvfp4WeightRecipe(
-                        object_prefix + "mlp/gate_up",
-                        (34816, 5120),
-                        (_all(gate), _all(up)),
-                        gate_up_sources,
-                    ),
-                    Nvfp4WeightRecipe(
-                        object_prefix + "mlp/down",
-                        down.shape,
-                        (_all(down),),
-                        (down,),
-                    ),
-                )
+        nvfp4_weights.extend(
+            (
+                Nvfp4WeightRecipe(
+                    object_prefix + "mlp/gate_up",
+                    (34816, 5120),
+                    (_all(gate), _all(up)),
+                    (gate, up),
+                ),
+                Nvfp4WeightRecipe(
+                    object_prefix + "mlp/down",
+                    down.shape,
+                    (_all(down),),
+                    (down,),
+                ),
             )
-            input_divisors.extend(
-                (
-                    InputDivisorRecipe(
-                        object_prefix
-                        + "mlp/gate_up_projection/input_scale_divisor",
-                        gate_up_sources,
-                        (object_prefix + "mlp/gate_up",),
-                    ),
-                    InputDivisorRecipe(
-                        object_prefix + "mlp/down_projection/input_scale_divisor",
-                        (down,),
-                        (object_prefix + "mlp/down",),
-                    ),
-                )
+        )
+        input_divisors.extend(
+            (
+                InputDivisorRecipe(
+                    object_prefix
+                    + "mlp/gate_up_projection/input_scale_divisor",
+                    (gate, up),
+                    (object_prefix + "mlp/gate_up",),
+                ),
+                InputDivisorRecipe(
+                    object_prefix + "mlp/down_projection/input_scale_divisor",
+                    (down,),
+                    (object_prefix + "mlp/down",),
+                ),
             )
-        else:
-            fp8_weights.extend(
-                (
-                    Fp8WeightRecipe(
-                        object_prefix + "mlp/gate_up",
-                        (34816, 5120),
-                        (_all(gate), _all(up)),
-                    ),
-                    Fp8WeightRecipe(
-                        object_prefix + "mlp/down",
-                        down.shape,
-                        (_all(down),),
-                    ),
-                )
-            )
+        )
 
+    # Vocabulary endpoints: W8G32 quantized from the excluded BF16 sources.
     output_head = _source("lm_head", 248320, 5120)
-    fp8_weights.append(
-        Fp8WeightRecipe(
-            "text/output_head", output_head.shape, (_all(output_head),)
+    w8_weights.append(
+        W8WeightRecipe("text/output_head", output_head.shape, (_all(output_head),))
+    )
+    embedding = _source(
+        "model.language_model.embed_tokens", 248320, 5120
+    )
+    w8_weights.append(
+        W8WeightRecipe(
+            "text/token_embedding", embedding.shape, (_all(embedding),)
+        )
+    )
+
+    # MTP matrices: W8G32 from the excluded BF16 sources.
+    mtp_layer = "mtp.layers.0."
+    mtp_q = _source(mtp_layer + "self_attn.q_proj", 12288, 5120)
+    w8_weights.extend(
+        (
+            W8WeightRecipe(
+                "mtp/input_projection",
+                (5120, 10240),
+                (_all(_source("mtp.fc", 5120, 10240)),),
+            ),
+            W8WeightRecipe(
+                "mtp/layer/attention/query_key_gate_value",
+                (14336, 5120),
+                (
+                    _q_part(mtp_q, False),
+                    _all(_source(mtp_layer + "self_attn.k_proj", 1024, 5120)),
+                    _q_part(mtp_q, True),
+                    _all(_source(mtp_layer + "self_attn.v_proj", 1024, 5120)),
+                ),
+            ),
+            W8WeightRecipe(
+                "mtp/layer/attention/output",
+                (5120, 6144),
+                (_all(_source(mtp_layer + "self_attn.o_proj", 5120, 6144)),),
+            ),
+            W8WeightRecipe(
+                "mtp/layer/mlp/gate_up",
+                (34816, 5120),
+                (
+                    _all(_source(mtp_layer + "mlp.gate_proj", 17408, 5120)),
+                    _all(_source(mtp_layer + "mlp.up_proj", 17408, 5120)),
+                ),
+            ),
+            W8WeightRecipe(
+                "mtp/layer/mlp/down",
+                (5120, 17408),
+                (_all(_source(mtp_layer + "mlp.down_proj", 5120, 17408)),),
+            ),
         )
     )
     return (
-        tuple(fp8_weights),
         tuple(nvfp4_weights),
         tuple(input_divisors),
-        tuple(divisor_groups),
+        tuple(w8_weights),
     )
 
 
-def _build_quantized_direct_recipes() -> tuple[family_recipe.TensorRecipe, ...]:
+def _build_direct_recipes() -> tuple[family_recipe.TensorRecipe, ...]:
     recipes: list[family_recipe.TensorRecipe] = []
     for layer in range(64):
         source_prefix = f"model.language_model.layers.{layer}."
@@ -327,64 +424,85 @@ def _build_quantized_direct_recipes() -> tuple[family_recipe.TensorRecipe, ...]:
     return tuple(recipes)
 
 
+# QAD mixed precision: the 52 attention objects whose source quads are
+# ModelOpt FP8 (per inventory.FP8_TENSOR_SPECS) pass through as row-scaled
+# FP8; every other projection stays an NVFP4 byte passthrough.
+FP8_PROJECTION_OBJECT_NAMES = frozenset(
+    spec.name for spec in inventory.FP8_TENSOR_SPECS
+)
+
 (
-    FP8_WEIGHT_RECIPES,
-    NVFP4_WEIGHT_RECIPES,
-    INPUT_DIVISOR_RECIPES,
-    WEIGHT_DIVISOR_GROUPS,
-) = _build_quantized_matrix_recipes()
-FP8_WEIGHTS_BY_NAME = {item.object_name: item for item in FP8_WEIGHT_RECIPES}
+    ALL_PROJECTION_RECIPES,
+    _ALL_INPUT_DIVISOR_RECIPES,
+    W8_WEIGHT_RECIPES,
+) = _build_matrix_recipes()
+NVFP4_WEIGHT_RECIPES = tuple(
+    item
+    for item in ALL_PROJECTION_RECIPES
+    if item.object_name not in FP8_PROJECTION_OBJECT_NAMES
+)
+FP8_WEIGHT_RECIPES = tuple(
+    item
+    for item in ALL_PROJECTION_RECIPES
+    if item.object_name in FP8_PROJECTION_OBJECT_NAMES
+)
+INPUT_DIVISOR_RECIPES = tuple(
+    item
+    for item in _ALL_INPUT_DIVISOR_RECIPES
+    if item.weight_names[0] not in FP8_PROJECTION_OBJECT_NAMES
+)
 NVFP4_WEIGHTS_BY_NAME = {
     item.object_name: item for item in NVFP4_WEIGHT_RECIPES
 }
+FP8_WEIGHTS_BY_NAME = {item.object_name: item for item in FP8_WEIGHT_RECIPES}
 INPUT_DIVISORS_BY_NAME = {
     item.object_name: item for item in INPUT_DIVISOR_RECIPES
 }
+W8_WEIGHTS_BY_NAME = {item.object_name: item for item in W8_WEIGHT_RECIPES}
 
+NVFP4_SOURCES = tuple(
+    dict.fromkeys(
+        part.source for recipe in NVFP4_WEIGHT_RECIPES for part in recipe.parts
+    )
+)
 FP8_SOURCES = tuple(
     dict.fromkeys(
         part.source for recipe in FP8_WEIGHT_RECIPES for part in recipe.parts
     )
 )
-NVFP4_SOURCES = tuple(
+W8_SOURCES = tuple(
     dict.fromkeys(
-        part.source
-        for recipe in NVFP4_WEIGHT_RECIPES
-        for part in recipe.parts
+        part.source for recipe in W8_WEIGHT_RECIPES for part in recipe.parts
     )
 )
 
-QUANTIZED_DIRECT_RECIPES = _build_quantized_direct_recipes()
-QUANTIZED_DIRECT_BY_NAME = {
-    item.object_name: item for item in QUANTIZED_DIRECT_RECIPES
-}
-QUANTIZED_DIRECT_SPECS = tuple(
+DIRECT_RECIPES = _build_direct_recipes()
+DIRECT_BY_NAME = {item.object_name: item for item in DIRECT_RECIPES}
+DIRECT_SPECS = tuple(
     spec
     for spec in inventory.TEXT_CORE_TENSOR_SPECS
-    if spec.name in QUANTIZED_DIRECT_BY_NAME
+    if spec.name in DIRECT_BY_NAME
 )
 
-OFFICIAL_TENSOR_SPECS = tuple(
+# Remaining tensors (draft head, MTP vectors, all 333 vision objects) reuse the
+# official recipes unchanged: Huihui keeps official source naming for them.
+DERIVED_TENSOR_SPECS = tuple(
     spec
     for spec in inventory.TENSOR_SPECS
-    if spec.name == "text/token_embedding"
-    or spec.name.startswith("text/draft_head")
-    or spec.name.startswith("mtp/")
+    if spec.name.startswith("text/draft_head")
+    or (
+        spec.name.startswith("mtp/")
+        and spec.name not in W8_WEIGHTS_BY_NAME
+    )
     or spec.name.startswith("vision/")
 )
-OFFICIAL_RECIPES = tuple(
+DERIVED_RECIPES = tuple(
     official_recipe.RECIPES_BY_NAME[spec.name]
-    for spec in OFFICIAL_TENSOR_SPECS
+    for spec in DERIVED_TENSOR_SPECS
 )
-OFFICIAL_RECIPES_BY_NAME = {
-    item.object_name: item for item in OFFICIAL_RECIPES
+DERIVED_RECIPES_BY_NAME = {
+    item.object_name: item for item in DERIVED_RECIPES
 }
-_embedding_expression = OFFICIAL_RECIPES_BY_NAME[
-    "text/token_embedding"
-].expression
-if not isinstance(_embedding_expression, family_recipe.SourceTensor):
-    raise ValueError("token embedding must map to one direct official source")
-OFFICIAL_EMBEDDING_SOURCE = _embedding_expression
 
 
 def _validate_matrix_recipe(
@@ -400,30 +518,25 @@ def _validate_matrix_recipe(
 
 
 def validate_recipe() -> None:
-    family_recipe.validate_recipe_coverage(
-        QUANTIZED_DIRECT_RECIPES, QUANTIZED_DIRECT_SPECS
-    )
-    family_recipe.validate_recipe_coverage(
-        OFFICIAL_RECIPES, OFFICIAL_TENSOR_SPECS
-    )
     if (
-        len(FP8_WEIGHT_RECIPES),
         len(NVFP4_WEIGHT_RECIPES),
+        len(FP8_WEIGHT_RECIPES),
         len(INPUT_DIVISOR_RECIPES),
-        len(WEIGHT_DIVISOR_GROUPS),
-        len(FP8_SOURCES),
+        len(W8_WEIGHT_RECIPES),
         len(NVFP4_SOURCES),
-        len(QUANTIZED_DIRECT_RECIPES),
-        len(OFFICIAL_RECIPES),
-    ) != (145, 112, 112, 56, 233, 168, 401, 348):
-        raise ValueError("Qwen3.8 NVFP4 source recipe is incomplete")
+        len(FP8_SOURCES),
+        len(W8_SOURCES),
+        len(DIRECT_RECIPES),
+        len(DERIVED_RECIPES),
+    ) != (204, 52, 204, 7, 306, 94, 10, 401, 342):
+        raise ValueError("mixed NVFP4/FP8 source recipe is incomplete")
     ownership = (
-        {"text/token_embedding"},
-        set(FP8_WEIGHTS_BY_NAME),
         set(NVFP4_WEIGHTS_BY_NAME),
+        set(FP8_WEIGHTS_BY_NAME),
         set(INPUT_DIVISORS_BY_NAME),
-        set(QUANTIZED_DIRECT_BY_NAME),
-        set(OFFICIAL_RECIPES_BY_NAME).difference({"text/token_embedding"}),
+        set(W8_WEIGHTS_BY_NAME),
+        set(DIRECT_BY_NAME),
+        set(DERIVED_RECIPES_BY_NAME),
     )
     all_names: set[str] = set()
     for names in ownership:
@@ -431,163 +544,151 @@ def validate_recipe() -> None:
             raise ValueError("more than one source route owns an artifact tensor")
         all_names.update(names)
     if all_names != {spec.name for spec in inventory.TENSOR_SPECS}:
-        raise ValueError("source routes do not cover the complete tensor inventory")
-    if tuple(FP8_WEIGHTS_BY_NAME) != tuple(
-        spec.name
-        for spec in inventory.FP8_TENSOR_SPECS
-        if spec.name != "text/token_embedding"
-    ):
-        raise ValueError("FP8 recipe order does not match inventory")
+        missing = {spec.name for spec in inventory.TENSOR_SPECS} - all_names
+        extra = all_names - {spec.name for spec in inventory.TENSOR_SPECS}
+        raise ValueError(
+            f"source routes do not cover the tensor inventory: {sorted(missing)[:3]} {sorted(extra)[:3]}"
+        )
     if tuple(NVFP4_WEIGHTS_BY_NAME) != tuple(
         spec.name for spec in inventory.NVFP4_TENSOR_SPECS
     ):
         raise ValueError("NVFP4 recipe order does not match inventory")
+    if tuple(FP8_WEIGHTS_BY_NAME) != tuple(
+        spec.name for spec in inventory.FP8_TENSOR_SPECS
+    ):
+        raise ValueError("FP8 recipe order does not match inventory")
     if tuple(INPUT_DIVISORS_BY_NAME) != tuple(
         spec.name for spec in inventory.INPUT_SCALE_DIVISOR_SPECS
     ):
         raise ValueError("input-divisor recipe order does not match inventory")
+    for recipe in NVFP4_WEIGHT_RECIPES:
+        _validate_matrix_recipe(recipe.object_name, recipe.shape, recipe.parts)
     for recipe in FP8_WEIGHT_RECIPES:
         _validate_matrix_recipe(recipe.object_name, recipe.shape, recipe.parts)
-    for recipe in NVFP4_WEIGHT_RECIPES:
+    for recipe in W8_WEIGHT_RECIPES:
         _validate_matrix_recipe(recipe.object_name, recipe.shape, recipe.parts)
     bound_weights = tuple(
         name for site in INPUT_DIVISOR_RECIPES for name in site.weight_names
     )
     if (
-        len(bound_weights) != 112
-        or len(set(bound_weights)) != 112
+        len(bound_weights) != 204
+        or len(set(bound_weights)) != 204
         or set(bound_weights) != set(NVFP4_WEIGHTS_BY_NAME)
     ):
         raise ValueError("input-divisor sites do not cover NVFP4 parents once")
 
 
-def _merge_requirement(
-    result: dict[str, tuple[tuple[int, ...], str]],
-    name: str,
-    shape: tuple[int, ...],
-    dtype: str,
-) -> None:
-    signature = (shape, dtype)
-    previous = result.setdefault(name, signature)
-    if previous != signature:
-        raise ValueError(f"inconsistent source declaration for {name}")
-
-
-def _source_requirements() -> dict[str, tuple[tuple[int, ...], str]]:
-    result: dict[str, tuple[tuple[int, ...], str]] = {}
-    for source in FP8_SOURCES:
-        n, k = source.shape
-        _merge_requirement(result, source.field("weight"), (n, k), "F8_E4M3")
-        _merge_requirement(
-            result, source.field("weight_scale"), (n, 1), "BF16"
-        )
-    for source in NVFP4_SOURCES:
-        n, k = source.shape
-        _merge_requirement(
-            result, source.field("weight_packed"), (n, k // 2), "U8"
-        )
-        _merge_requirement(
-            result, source.field("weight_scale"), (n, k // 16), "F8_E4M3"
-        )
-        _merge_requirement(
-            result, source.field("weight_global_scale"), (1,), "F32"
-        )
-        _merge_requirement(
-            result, source.field("input_global_scale"), (1,), "F32"
-        )
-    for source in family_recipe.source_requirements(
-        QUANTIZED_DIRECT_RECIPES
-    ).values():
-        _merge_requirement(result, source.name, source.shape, source.dtype)
-    return result
-
-
-SOURCE_REQUIREMENTS = _source_requirements()
-EXPECTED_QUANTIZED_FIELDS = frozenset(
-    name
-    for name, (_, dtype) in SOURCE_REQUIREMENTS.items()
-    if dtype in ("F8_E4M3", "F32", "U8")
-)
-
-
-def preflight_quantized_metadata(
-    reader: ShardReader,
-) -> family_recipe.SourcePreflight:
-    missing = set(SOURCE_REQUIREMENTS).difference(reader.names)
-    if missing:
-        raise ValueError(f"quantized source is missing {sorted(missing)[0]}")
-
-    for source in FP8_SOURCES:
-        for suffix in (
-            "weight_packed",
-            "weight_global_scale",
-            "input_global_scale",
-        ):
-            name = source.field(suffix)
-            if reader.has(name):
-                raise ValueError(f"FP8 source has forbidden field {name}")
-    for source in NVFP4_SOURCES:
-        if reader.has(source.field("weight")):
-            raise ValueError(
-                f"NVFP4 source has forbidden field {source.field('weight')}"
-            )
-
-    metadata = reader.metadata(reader.names)
-    actual_quantized_fields = frozenset(
-        name
-        for name, item in metadata.items()
-        if item.dtype in ("F8_E4M3", "F32", "U8")
-    )
-    if actual_quantized_fields != EXPECTED_QUANTIZED_FIELDS:
-        unexpected = actual_quantized_fields.difference(EXPECTED_QUANTIZED_FIELDS)
-        missing_fields = EXPECTED_QUANTIZED_FIELDS.difference(
-            actual_quantized_fields
-        )
-        detail = (
-            sorted(unexpected)[0]
-            if unexpected
-            else sorted(missing_fields)[0]
-        )
-        raise ValueError(f"quantized source allocation is not closed: {detail}")
-
-    dtype_counts: dict[str, int] = {}
-    shards: set[str] = set()
-    for name, (shape, dtype) in SOURCE_REQUIREMENTS.items():
-        actual = metadata[name]
-        if actual.shape != shape or actual.dtype != dtype:
-            raise ValueError(
-                f"{name}: source signature {(actual.shape, actual.dtype)} "
-                f"!= {(shape, dtype)}"
-            )
-        dtype_counts[dtype] = dtype_counts.get(dtype, 0) + 1
-        shards.add(actual.shard)
-    return family_recipe.SourcePreflight(
-        recipe_count=(
-            len(FP8_WEIGHT_RECIPES)
-            + len(NVFP4_WEIGHT_RECIPES)
-            + len(INPUT_DIVISOR_RECIPES)
-            + len(QUANTIZED_DIRECT_RECIPES)
-        ),
-        source_tensor_count=len(SOURCE_REQUIREMENTS),
-        source_shard_count=len(shards),
-        source_dtype_counts=dtype_counts,
-    )
-
-
-def preflight_official_sources(
-    reader: ShardReader,
-) -> family_recipe.SourcePreflight:
-    return family_recipe.preflight_source_reader(reader, OFFICIAL_RECIPES)
-
-
 def _word(tensor: torch.Tensor, name: str) -> int:
     if tensor.dtype != torch.float32 or tensor.numel() != 1:
-        raise ValueError(f"{name}: divisor must be FP32[1]")
+        raise ValueError(f"{name}: scalar must be FP32[1]")
     word = int(tensor.detach().contiguous().cpu().view(torch.int32).item())
     word &= 0xFFFFFFFF
     if not valid_positive_fp32_word(word):
-        raise ValueError(f"{name}: divisor must be finite and positive")
+        raise ValueError(f"{name}: scalar must be finite and positive")
     return word
+
+
+_ONE_MULTIPLIER_WORD = 0x3F800000  # exact FP32 bits of 1.0
+
+# Nearest-e2m1 magnitude boundaries: (0,.5),(0.5,1),(1,1.5),(1.5,2),(2,3),
+# (3,4),(4,6) midpoints. bucketize(mag, boundaries) yields the magnitude
+# index used with the sign bit 0x8 -- the same words the engine decodes.
+_E2M1_BOUNDARIES = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+
+
+def quantize_matrix_to_nvfp4(
+    matrix: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """Quantize a BF16 [N, K] matrix to the ModelOpt NVFP4 triple.
+
+    Per 16-element block: scale = e4m3(amax / (6 * s2)) with the per-tensor
+    multiplier s2 = amax_tensor / 448 so the largest block lands on the e4m3
+    rail head. Codes are nearest e2m1 with the sign bit 0x8. Returns
+    (packed U8 [N, K/2], scales F8E4M3 [N, K/16], s2 multiplier).
+    """
+
+    wf = matrix.to(torch.float32)
+    n, k = wf.shape
+    if k % 16:
+        raise ValueError("NVFP4 quantization requires K divisible by 16")
+    blocks = wf.reshape(n, k // 16, 16)
+    amax = blocks.abs().amax(dim=2)
+    amax_tensor = float(amax.max())
+    if not amax_tensor > 0.0:
+        raise ValueError("cannot NVFP4-quantize an all-zero matrix")
+    scale_2 = amax_tensor / 448.0
+    scale = (amax / (6.0 * scale_2)).clamp(max=448.0)
+    scale = torch.where(
+        scale > 0.0, scale, torch.full_like(scale, torch.finfo(torch.float32).tiny)
+    )
+    scales_e4m3 = scale.to(torch.float8_e4m3fn)
+    denom = scales_e4m3.to(torch.float32) * scale_2
+    norm = blocks / denom.unsqueeze(2)
+    boundaries = torch.tensor(_E2M1_BOUNDARIES, dtype=torch.float32)
+    magnitude = torch.bucketize(norm.abs(), boundaries).to(torch.uint8)
+    negative = (
+        torch.copysign(torch.ones_like(norm), norm) < 0.0
+    ).to(torch.uint8)
+    codes = (magnitude | (negative << 3)).reshape(n, k)
+    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    return packed, scales_e4m3, scale_2
+
+
+def materialize_fp8_weight(
+    recipe: Nvfp4WeightRecipe,
+    reader: ShardReader,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FP8 byte passthrough into the artifact's row-scaled FP8 storage.
+
+    ModelOpt FP8 per-tensor quads (``weight`` F8E4M3 [N,K], ``weight_scale``
+    F32 scalar) satisfy ``W = e4m3 * weight_scale``. The row-scale-v1 payload
+    is exactly these code words plus a BF16 per-row multiplier, so each fused
+    part's row range carries its own source scale. Code bytes stay
+    bit-identical; the only numerical change is the scalar broadcast rounding
+    F32 -> BF16 (<= 2^-8 relative; 89 of 94 QAD scalars are not BF16-exact).
+    """
+
+    code_parts: list[torch.Tensor] = []
+    scale_parts: list[torch.Tensor] = []
+    for part in recipe.parts:
+        n, k = part.source.shape
+        weight = reader.get(part.source.field(WEIGHT))
+        scale_word = reader.get(part.source.field(WEIGHT_SCALE))
+        if (
+            weight.dtype != torch.float8_e4m3fn
+            or tuple(weight.shape) != (n, k)
+            or scale_word.dtype != torch.float32
+            or scale_word.numel() != 1
+        ):
+            raise ValueError(f"{part.source.name}: ModelOpt FP8 signature mismatch")
+        scale = float(scale_word.reshape(()).item())
+        if not (scale > 0.0 and scale < float("inf")):
+            raise ValueError(f"{part.source.name}: FP8 weight scale is invalid")
+        code_parts.append(_select_rows(weight.view(torch.uint8), part))
+        scale_parts.append(
+            torch.full((part.output_rows,), scale, dtype=torch.bfloat16)
+        )
+        del weight
+    codes = _fuse(code_parts)
+    scales = _fuse(scale_parts)
+    del code_parts, scale_parts
+    if tuple(codes.shape) != recipe.shape or tuple(scales.shape) != (
+        recipe.shape[0],
+    ):
+        raise ValueError(f"{recipe.object_name}: materialized FP8 shape mismatch")
+    return codes, scales
+
+
+def _optional_multiplier_word(
+    reader: ShardReader,
+    source: MatrixSource,
+) -> int:
+    """Read weight_scale_2, treating a QAD-omitted field as exactly 1.0."""
+
+    field = source.field(WEIGHT_SCALE_2)
+    if not reader.has(field):
+        return _ONE_MULTIPLIER_WORD
+    return _word(reader.get(field), field)
 
 
 def _same_divisor(
@@ -615,54 +716,22 @@ def _select_rows(tensor: torch.Tensor, part: MatrixPart) -> torch.Tensor:
     return torch.cat(pieces, dim=0)
 
 
-def materialize_fp8_weight(
-    recipe: Fp8WeightRecipe,
-    reader: ShardReader,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    code_parts: list[torch.Tensor] = []
-    scale_parts: list[torch.Tensor] = []
-    source_words: dict[MatrixSource, tuple[torch.Tensor, torch.Tensor]] = {}
-    for part in recipe.parts:
-        words = source_words.get(part.source)
-        if words is None:
-            source_codes = reader.get(part.source.field("weight"))
-            source_scales = reader.get(
-                part.source.field("weight_scale")
-            ).reshape(-1)
-            if (
-                source_codes.dtype != torch.float8_e4m3fn
-                or tuple(source_codes.shape) != part.source.shape
-                or source_scales.dtype != torch.bfloat16
-                or tuple(source_scales.shape) != (part.source.shape[0],)
-            ):
-                raise ValueError(
-                    f"{part.source.name}: materialized FP8 source signature mismatch"
-                )
-            words = (source_codes.view(torch.uint8), source_scales)
-            source_words[part.source] = words
-        code_parts.append(_select_rows(words[0], part))
-        scale_parts.append(_select_rows(words[1], part))
-    codes = (
-        code_parts[0].contiguous()
-        if len(code_parts) == 1
-        else torch.cat(code_parts, dim=0)
-    )
-    scales = (
-        scale_parts[0].contiguous()
-        if len(scale_parts) == 1
-        else torch.cat(scale_parts, dim=0)
-    )
-    if tuple(codes.shape) != recipe.shape or tuple(scales.shape) != (
-        recipe.shape[0],
-    ):
-        raise ValueError(f"{recipe.object_name}: materialized FP8 shape mismatch")
-    return codes, scales
+def _fuse(parts: list[torch.Tensor]) -> torch.Tensor:
+    return parts[0].contiguous() if len(parts) == 1 else torch.cat(parts, dim=0)
 
 
 def materialize_nvfp4_weight(
     recipe: Nvfp4WeightRecipe,
     reader: ShardReader,
 ) -> tuple[torch.Tensor, torch.Tensor, bytes]:
+    """Byte passthrough: fuse ModelOpt packed/scale rows, no dequantization.
+
+    Every part must be an NVFP4 quad (U8 packed + F8E4M3 block scales); the
+    ModelOpt FP8 attention quads take the row-scaled passthrough in
+    ``materialize_fp8_weight`` instead (they are separate FP8 recipes since
+    v4, so fused groups are format-homogeneous by construction).
+    """
+
     packed_parts: list[torch.Tensor] = []
     scale_parts: list[torch.Tensor] = []
     source_words: dict[MatrixSource, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -670,8 +739,8 @@ def materialize_nvfp4_weight(
         words = source_words.get(part.source)
         if words is None:
             n, k = part.source.shape
-            source_packed = reader.get(part.source.field("weight_packed"))
-            source_scales = reader.get(part.source.field("weight_scale"))
+            source_packed = reader.get(part.source.field(WEIGHT))
+            source_scales = reader.get(part.source.field(WEIGHT_SCALE))
             if (
                 source_packed.dtype != torch.uint8
                 or tuple(source_packed.shape) != (n, k // 2)
@@ -679,60 +748,210 @@ def materialize_nvfp4_weight(
                 or tuple(source_scales.shape) != (n, k // 16)
             ):
                 raise ValueError(
-                    f"{part.source.name}: materialized NVFP4 source signature mismatch"
+                    f"{part.source.name}: ModelOpt NVFP4 quad signature mismatch"
                 )
             words = (source_packed, source_scales.view(torch.uint8))
             source_words[part.source] = words
         packed_parts.append(_select_rows(words[0], part))
         scale_parts.append(_select_rows(words[1], part))
-    packed = (
-        packed_parts[0].contiguous()
-        if len(packed_parts) == 1
-        else torch.cat(packed_parts, dim=0)
-    )
-    scales = (
-        scale_parts[0].contiguous()
-        if len(scale_parts) == 1
-        else torch.cat(scale_parts, dim=0)
-    )
-    divisor = _same_divisor(
-        reader, recipe.divisor_sources, "weight_global_scale"
-    )
+    packed = _fuse(packed_parts)
+    scales = _fuse(scale_parts)
+    # ModelOpt's weight_scale_2 is a MULTIPLIER (w = e2m1 * scale * scale_2);
+    # the engine's NVFP4 kernels dequantize with a DIVISOR
+    # (w = e2m1 * scale / divisor, see nvfp4_linear_add_*.cu). Store the
+    # reciprocal so the passthrough bytes reconstruct the same weights.
+    words = {
+        _optional_multiplier_word(reader, source)
+        for source in recipe.divisor_sources
+    }
+    if len(words) != 1:
+        raise ValueError(
+            f"{recipe.divisor_sources[0].name}: fused weight_scale_2 words differ"
+        )
+    scale_2 = struct.unpack("<f", struct.pack("<I", words.pop()))[0]
+    divisor = 1.0 / scale_2
+    if not (divisor > 0.0 and divisor < float("inf")):
+        raise ValueError(f"{recipe.object_name}: reciprocal weight scale is invalid")
     if tuple(packed.shape) != (recipe.shape[0], recipe.shape[1] // 2) or tuple(
         scales.shape
     ) != (recipe.shape[0], recipe.shape[1] // 16):
         raise ValueError(
             f"{recipe.object_name}: materialized NVFP4 shape mismatch"
         )
-    return packed, scales, struct.pack("<I", divisor)
+    return packed, scales, struct.pack("<f", divisor)
 
 
 def materialize_input_divisor(
     recipe: InputDivisorRecipe,
     reader: ShardReader,
 ) -> torch.Tensor:
-    word = _same_divisor(reader, recipe.sources, "input_global_scale")
+    word = _same_divisor(reader, recipe.sources, INPUT_SCALE)
     return torch.frombuffer(
         bytearray(struct.pack("<I", word)), dtype=torch.float32
     ).reshape(())
 
 
-def materialize_quantized_direct(
-    object_name: str,
+def materialize_w8_weight(
+    recipe: W8WeightRecipe,
     reader: ShardReader,
 ) -> torch.Tensor:
-    return family_recipe.materialize_recipe(
-        QUANTIZED_DIRECT_BY_NAME[object_name], reader
-    )
+    """Fuse BF16 source rows into one [N,K] matrix for W8G32 quantization."""
+
+    row_parts: list[torch.Tensor] = []
+    source_cache: dict[MatrixSource, torch.Tensor] = {}
+    for part in recipe.parts:
+        rows = source_cache.get(part.source)
+        if rows is None:
+            n, k = part.source.shape
+            rows = reader.get(part.source.field(WEIGHT))
+            if rows.dtype != torch.bfloat16 or tuple(rows.shape) != (n, k):
+                raise ValueError(
+                    f"{part.source.name}: BF16 W8 source signature mismatch"
+                )
+            source_cache[part.source] = rows
+        row_parts.append(_select_rows(rows, part))
+    fused = _fuse(row_parts)
+    if tuple(fused.shape) != recipe.shape:
+        raise ValueError(f"{recipe.object_name}: materialized W8 shape mismatch")
+    return fused
 
 
-def materialize_official(
+def materialize_direct(object_name: str, reader: ShardReader) -> torch.Tensor:
+    return family_recipe.materialize_recipe(DIRECT_BY_NAME[object_name], reader)
+
+
+def materialize_derived(
     object_name: str,
     reader: ShardReader,
     derived_tensors: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     return family_recipe.materialize_recipe(
-        OFFICIAL_RECIPES_BY_NAME[object_name], reader, derived_tensors
+        DERIVED_RECIPES_BY_NAME[object_name], reader, derived_tensors
+    )
+
+
+def _merge_requirement(
+    result: dict[str, tuple[tuple[int, ...], str]],
+    name: str,
+    shape: tuple[int, ...],
+    dtype: str,
+) -> None:
+    signature = (shape, dtype)
+    previous = result.setdefault(name, signature)
+    if previous != signature:
+        raise ValueError(f"inconsistent source declaration for {name}")
+
+
+def _source_requirements() -> dict[str, tuple[tuple[int, ...], str]]:
+    result: dict[str, tuple[tuple[int, ...], str]] = {}
+    for source in NVFP4_SOURCES:
+        n, k = source.shape
+        _merge_requirement(result, source.field(WEIGHT), (n, k // 2), "U8")
+        _merge_requirement(
+            result, source.field(WEIGHT_SCALE), (n, k // 16), "F8_E4M3"
+        )
+        _merge_requirement(result, source.field(INPUT_SCALE), (), "F32")
+    for source in FP8_SOURCES:
+        n, k = source.shape
+        _merge_requirement(result, source.field(WEIGHT), (n, k), "F8_E4M3")
+        _merge_requirement(result, source.field(WEIGHT_SCALE), (), "F32")
+        _merge_requirement(result, source.field(INPUT_SCALE), (1,), "F32")
+    for source in W8_SOURCES:
+        n, k = source.shape
+        _merge_requirement(result, source.field(WEIGHT), (n, k), "BF16")
+    for source in family_recipe.source_requirements(DIRECT_RECIPES).values():
+        _merge_requirement(result, source.name, source.shape, source.dtype)
+    for source in family_recipe.source_requirements(DERIVED_RECIPES).values():
+        _merge_requirement(result, source.name, source.shape, source.dtype)
+    return result
+
+
+SOURCE_REQUIREMENTS = _source_requirements()
+# ModelOpt KV-cache FP8 scales ride along in the checkpoint but are not
+# consumed by the artifact; admit them explicitly.
+_KV_SCALE_FIELDS = frozenset(
+    name
+    for name in (
+        f"model.language_model.layers.{layer}.self_attn.k_proj.k_scale"
+        for layer in inventory.FULL_ATTENTION_LAYERS
+    )
+) | frozenset(
+    name
+    for name in (
+        f"model.language_model.layers.{layer}.self_attn.v_proj.v_scale"
+        for layer in inventory.FULL_ATTENTION_LAYERS
+    )
+)
+
+
+def preflight_quantized_metadata(
+    reader: ShardReader,
+) -> family_recipe.SourcePreflight:
+    missing = set(SOURCE_REQUIREMENTS).difference(reader.names)
+    if missing:
+        raise ValueError(f"quantized source is missing {sorted(missing)[0]}")
+    # QAD mixed precision is pinned by the closed recipe: the FP8 quad set is
+    # declared with exact signatures (weight F8E4M3 [N,K], scalar F32
+    # weight_scale, input_scale F32[1]) and the NVFP4 quads with theirs, so a
+    # checkpoint whose format split differs from the recipe fails preflight.
+
+    metadata = reader.metadata(reader.names)
+    dtype_counts: dict[str, int] = {}
+    shards: set[str] = set()
+    for name, (shape, dtype) in SOURCE_REQUIREMENTS.items():
+        actual = metadata[name]
+        if actual.shape != shape or actual.dtype != dtype:
+            raise ValueError(
+                f"{name}: source signature {(actual.shape, actual.dtype)} "
+                f"!= {(shape, dtype)}"
+            )
+        dtype_counts[actual.dtype] = dtype_counts.get(actual.dtype, 0) + 1
+        shards.add(actual.shard)
+    fp8_source_count = sum(
+        1
+        for source in FP8_SOURCES
+        if metadata[source.field(WEIGHT)].dtype == "F8_E4M3"
+    )
+    # Closed-field check: every quantized-looking field in the checkpoint must
+    # be a declared quad member (or an admitted KV-cache scale).
+    declared_quantized = frozenset(
+        name
+        for name, (_, dtype) in SOURCE_REQUIREMENTS.items()
+        if dtype in ("F8_E4M3", "F32", "U8")
+    )
+    actual_quantized = frozenset(
+        name
+        for name, item in metadata.items()
+        if item.dtype in ("F8_E4M3", "F32", "U8")
+    )
+    # QAD omits weight_scale_2 wherever the multiplier is 1.0: an on-disk
+    # copy is optional per quantized source and need not be pre-declared.
+    optional_scales = frozenset(
+        source.field(WEIGHT_SCALE_2)
+        for source in (*NVFP4_SOURCES, *FP8_SOURCES)
+    )
+    undeclared = (
+        actual_quantized - declared_quantized - _KV_SCALE_FIELDS - optional_scales
+    )
+    if undeclared:
+        raise ValueError(
+            f"quantized source allocation is not closed: {sorted(undeclared)[0]}"
+        )
+    return family_recipe.SourcePreflight(
+        recipe_count=(
+            len(NVFP4_WEIGHT_RECIPES)
+            + len(FP8_WEIGHT_RECIPES)
+            + len(INPUT_DIVISOR_RECIPES)
+            + len(W8_WEIGHT_RECIPES)
+            + len(DIRECT_RECIPES)
+            + len(DERIVED_RECIPES)
+        ),
+        source_tensor_count=len(SOURCE_REQUIREMENTS),
+        source_shard_count=len(shards),
+        source_dtype_counts={
+            **dtype_counts,
+            "FP8_PASSTHROUGH_SOURCES": fp8_source_count,
+        },
     )
 
 
@@ -742,7 +961,12 @@ validate_recipe()
 __all__ = [
     "BASE_REPOSITORY",
     "BASE_REVISION",
-    "EXPECTED_QUANTIZED_FIELDS",
+    "DERIVED_RECIPES",
+    "DERIVED_RECIPES_BY_NAME",
+    "DERIVED_TENSOR_SPECS",
+    "DIRECT_BY_NAME",
+    "DIRECT_RECIPES",
+    "DIRECT_SPECS",
     "FP8_SOURCES",
     "FP8_WEIGHT_RECIPES",
     "FP8_WEIGHTS_BY_NAME",
@@ -751,23 +975,18 @@ __all__ = [
     "NVFP4_SOURCES",
     "NVFP4_WEIGHT_RECIPES",
     "NVFP4_WEIGHTS_BY_NAME",
-    "OFFICIAL_EMBEDDING_SOURCE",
-    "OFFICIAL_RECIPES",
-    "OFFICIAL_RECIPES_BY_NAME",
-    "OFFICIAL_TENSOR_SPECS",
-    "QUANTIZED_DIRECT_BY_NAME",
-    "QUANTIZED_DIRECT_RECIPES",
-    "QUANTIZED_DIRECT_SPECS",
     "QUANTIZED_REPOSITORY",
     "QUANTIZED_REVISION",
     "SOURCE_REQUIREMENTS",
-    "WEIGHT_DIVISOR_GROUPS",
+    "W8_SOURCES",
+    "W8_WEIGHT_RECIPES",
+    "W8_WEIGHTS_BY_NAME",
+    "materialize_direct",
+    "materialize_derived",
     "materialize_fp8_weight",
     "materialize_input_divisor",
     "materialize_nvfp4_weight",
-    "materialize_official",
-    "materialize_quantized_direct",
-    "preflight_official_sources",
+    "materialize_w8_weight",
     "preflight_quantized_metadata",
     "validate_recipe",
 ]

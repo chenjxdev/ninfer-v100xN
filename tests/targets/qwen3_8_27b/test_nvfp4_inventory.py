@@ -35,7 +35,7 @@ def test_complete_nvfp4_inventory_and_format_allocation() -> None:
     }
     assert len(inventory.LOGICAL_ROW_VIEW_SPECS) == 18
     assert len(inventory.ALIAS_SPECS) == 4
-    assert convert_nvfp4.RECIPE_ID == "qwen3_8_27b_nvfp4-v1"
+    assert convert_nvfp4.RECIPE_ID == "qwen3_8_27b_nvfp4-v2-nace"
     assert convert_nvfp4.OUTPUT_BASENAME == "qwen3_8_27b_nvfp4.ninfer"
 
 
@@ -89,15 +89,15 @@ def test_closed_dual_source_recipe_and_tensor_ownership() -> None:
         len(recipe.QUANTIZED_DIRECT_RECIPES),
         len(recipe.OFFICIAL_RECIPES),
         len(recipe.SOURCE_REQUIREMENTS),
-    ) == (145, 112, 112, 56, 233, 168, 401, 348, 1587)
+    ) == (145, 112, 112, 56, 233, 168, 401, 348, 2010)
     dtype_counts: dict[str, int] = {}
     for _, dtype in recipe.SOURCE_REQUIREMENTS.values():
         dtype_counts[dtype] = dtype_counts.get(dtype, 0) + 1
     assert dtype_counts == {
-        "BF16": 682,
-        "F8_E4M3": 401,
-        "U8": 168,
-        "F32": 336,
+        "BF16": 354,
+        "F8_E4M3": 496,
+        "U8": 496,
+        "F32": 664,
     }
     assert recipe.OFFICIAL_EMBEDDING_SOURCE.name == (
         "model.language_model.embed_tokens.weight"

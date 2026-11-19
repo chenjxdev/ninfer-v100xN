@@ -1,4 +1,16 @@
-"""Persistent-object contract for the Qwen3.8-27B NVFP4 artifact."""
+"""Persistent-object contract for the Qwen3.8-27B mixed NVFP4/FP8 artifact.
+
+Derived from the full-NVFP4 inventory (backup .bak-20261119-fp8pt) by routing
+the checkpoint's ModelOpt FP8 attention quads to row-scaled FP8 storage
+(``FP8_E4M3FN_ROW_BF16S`` / ``row-scale-v1``) as a byte passthrough instead of
+requantizing them to NVFP4; every NVFP4 quad stays a byte passthrough with its
+paired FP32 input scale divisor. The artifact therefore lands in the engine's
+mixed ``Qwen38Nvfp4`` profile (per-object format binding), keeping the W8G32
+vocabulary endpoints of the full profile. FP8 projections are: every
+full-attention layer's qkv gate + o_proj (32 objects) and the ten GDN layers
+in ``FP8_GDN_LAYERS`` (20 objects) -- 52 objects over 94 ModelOpt FP8 source
+quads.
+"""
 
 from __future__ import annotations
 
@@ -7,8 +19,6 @@ from tools.convert.qwen3_6.common.inventory import (
     CONTIGUOUS_LAYOUT,
     FP32,
     I32,
-    LogicalAliasSpec,
-    LogicalRowViewSpec,
     Q4,
     Q5,
     Q6,
@@ -43,8 +53,9 @@ FULL_ATTENTION_LAYERS = tuple(range(3, 64, 4))
 GDN_LAYERS = tuple(
     layer for layer in range(64) if layer not in FULL_ATTENTION_LAYERS
 )
-NVFP4_MLP_LAYERS = tuple(range(56))
-FP8_MLP_LAYERS = tuple(range(56, 64))
+# The ten GDN layers whose attention quads ModelOpt exported as FP8
+# per-tensor instead of NVFP4 (verified against the QAD shard metadata).
+FP8_GDN_LAYERS = (0, 1, 2, 4, 5, 57, 58, 60, 61, 62)
 
 
 def tensor_spec(
@@ -61,18 +72,20 @@ def tensor_spec(
     elif numeric_format == FP8:
         layout = ROW_SCALE_LAYOUT
     else:
-        raise ValueError(f"unsupported Qwen3.8 NVFP4 format: {numeric_format}")
+        raise ValueError(f"unsupported Qwen3.8 mixed-NVFP4 format: {numeric_format}")
     return TensorSpec(name, shape, numeric_format, layout)
 
 
 def _build_text_core_specs() -> tuple[TensorSpec, ...]:
     specs: list[TensorSpec] = [
-        tensor_spec("text/token_embedding", (248320, 5120), FP8),
+        tensor_spec("text/token_embedding", (248320, 5120), W8),
     ]
     for layer in range(64):
         prefix = f"text/layers/{layer}/"
         specs.append(tensor_spec(prefix + "input_norm", (5120,), BF16))
         if layer in FULL_ATTENTION_LAYERS:
+            # QAD stores every full-attention quad as ModelOpt FP8: both
+            # projections pass through as row-scaled FP8 (no input divisor).
             specs.extend(
                 (
                     tensor_spec(
@@ -87,7 +100,8 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
                     ),
                 )
             )
-        else:
+        elif layer in FP8_GDN_LAYERS:
+            # Ten GDN layers share the same FP8 treatment.
             specs.extend(
                 (
                     tensor_spec(prefix + "gdn/a_log", (48,), FP32),
@@ -107,44 +121,61 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
                     tensor_spec(prefix + "gdn/output", (5120, 6144), FP8),
                 )
             )
+        else:
+            specs.extend(
+                (
+                    tensor_spec(prefix + "gdn/a_log", (48,), FP32),
+                    tensor_spec(prefix + "gdn/dt_bias", (48,), FP32),
+                    tensor_spec(
+                        prefix + "gdn/convolution", (4, 10240), BF16
+                    ),
+                    tensor_spec(
+                        prefix + "gdn/a_b_projection", (96, 5120), BF16
+                    ),
+                    tensor_spec(
+                        prefix + "gdn/query_key_value_z",
+                        (16384, 5120),
+                        NVFP4,
+                    ),
+                    tensor_spec(
+                        prefix + "gdn/input_projection/input_scale_divisor",
+                        (),
+                        FP32,
+                    ),
+                    tensor_spec(prefix + "gdn/norm", (128,), BF16),
+                    tensor_spec(prefix + "gdn/output", (5120, 6144), NVFP4),
+                    tensor_spec(
+                        prefix + "gdn/output_projection/input_scale_divisor",
+                        (),
+                        FP32,
+                    ),
+                )
+            )
 
         specs.append(
             tensor_spec(prefix + "post_attention_norm", (5120,), BF16)
         )
-        if layer in NVFP4_MLP_LAYERS:
-            specs.extend(
-                (
-                    tensor_spec(
-                        prefix + "mlp/gate_up", (34816, 5120), NVFP4
-                    ),
-                    tensor_spec(
-                        prefix
-                        + "mlp/gate_up_projection/input_scale_divisor",
-                        (),
-                        FP32,
-                    ),
-                    tensor_spec(
-                        prefix + "mlp/down", (5120, 17408), NVFP4
-                    ),
-                    tensor_spec(
-                        prefix + "mlp/down_projection/input_scale_divisor",
-                        (),
-                        FP32,
-                    ),
-                )
+        specs.extend(
+            (
+                tensor_spec(prefix + "mlp/gate_up", (34816, 5120), NVFP4),
+                tensor_spec(
+                    prefix + "mlp/gate_up_projection/input_scale_divisor",
+                    (),
+                    FP32,
+                ),
+                tensor_spec(prefix + "mlp/down", (5120, 17408), NVFP4),
+                tensor_spec(
+                    prefix + "mlp/down_projection/input_scale_divisor",
+                    (),
+                    FP32,
+                ),
             )
-        else:
-            specs.extend(
-                (
-                    tensor_spec(prefix + "mlp/gate_up", (34816, 5120), FP8),
-                    tensor_spec(prefix + "mlp/down", (5120, 17408), FP8),
-                )
-            )
+        )
 
     specs.extend(
         (
             tensor_spec("text/final_norm", (5120,), BF16),
-            tensor_spec("text/output_head", (248320, 5120), FP8),
+            tensor_spec("text/output_head", (248320, 5120), W8),
         )
     )
     return tuple(specs)
@@ -197,6 +228,11 @@ LAYOUT_COUNTS = {
     layout: sum(spec.layout == layout for spec in TENSOR_SPECS)
     for layout in LAYOUT_NAMES
 }
+
+from tools.convert.qwen3_6.common.inventory import (  # noqa: E402
+    LogicalAliasSpec,
+    LogicalRowViewSpec,
+)
 
 LOGICAL_ROW_VIEW_SPECS = (
     LogicalRowViewSpec(
@@ -363,9 +399,8 @@ ALIAS_SPECS = (
 NVFP4_TENSOR_SPECS = tuple(
     spec for spec in TENSOR_SPECS if spec.format == NVFP4
 )
-FP8_TENSOR_SPECS = tuple(
-    spec for spec in TENSOR_SPECS if spec.format == FP8
-)
+FP8_TENSOR_SPECS = tuple(spec for spec in TENSOR_SPECS if spec.format == FP8)
+W8_TENSOR_SPECS = tuple(spec for spec in TENSOR_SPECS if spec.format == W8)
 INPUT_SCALE_DIVISOR_SPECS = tuple(
     spec
     for spec in TENSOR_SPECS
@@ -376,7 +411,7 @@ INPUT_SCALE_DIVISOR_SPECS = tuple(
 def validate_inventory() -> None:
     names = tuple(spec.name for spec in OBJECT_SPECS)
     if len(names) != len(set(names)):
-        raise ValueError("Qwen3.8 NVFP4 inventory contains duplicate names")
+        raise ValueError("Qwen3.8 mixed-NVFP4 inventory contains duplicate names")
     if (
         len(TEXT_CORE_TENSOR_SPECS),
         len(DRAFT_HEAD_TENSOR_SPECS),
@@ -386,26 +421,27 @@ def validate_inventory() -> None:
         len(OBJECT_SPECS),
         len(NVFP4_TENSOR_SPECS),
         len(FP8_TENSOR_SPECS),
+        len(W8_TENSOR_SPECS),
         len(INPUT_SCALE_DIVISOR_SPECS),
-    ) != (771, 2, 12, 333, 1118, 1124, 112, 146, 112):
-        raise ValueError("registered Qwen3.8 NVFP4 inventory is incomplete")
+    ) != (863, 2, 12, 333, 1210, 1216, 204, 52, 9, 204):
+        raise ValueError("registered Qwen3.8 mixed-NVFP4 inventory is incomplete")
     if FORMAT_COUNTS != {
         BF16: 534,
-        FP32: 208,
+        FP32: 300,
         I32: 1,
         Q4: 55,
         Q5: 54,
         Q6: 1,
-        W8: 7,
-        NVFP4: 112,
-        FP8: 146,
+        W8: 9,
+        NVFP4: 204,
+        FP8: 52,
     }:
         raise ValueError(f"unexpected numeric allocation: {FORMAT_COUNTS}")
     if LAYOUT_COUNTS != {
-        CONTIGUOUS_LAYOUT: 743,
-        ROW_SPLIT_LAYOUT: 117,
-        BLOCK_SCALE_LAYOUT: 112,
-        ROW_SCALE_LAYOUT: 146,
+        CONTIGUOUS_LAYOUT: 835,
+        ROW_SPLIT_LAYOUT: 119,
+        BLOCK_SCALE_LAYOUT: 204,
+        ROW_SCALE_LAYOUT: 52,
     }:
         raise ValueError(f"unexpected layout allocation: {LAYOUT_COUNTS}")
 
@@ -421,10 +457,10 @@ __all__ = [
     "DRAFT_HEAD_TENSOR_SPECS",
     "FORMAT_COUNTS",
     "FORMAT_NAMES",
-    "FP32",
     "FP8",
-    "FP8_MLP_LAYERS",
+    "FP8_GDN_LAYERS",
     "FP8_TENSOR_SPECS",
+    "FP32",
     "FULL_ATTENTION_LAYERS",
     "GDN_LAYERS",
     "I32",
@@ -435,15 +471,14 @@ __all__ = [
     "MODEL_ID",
     "MTP_TENSOR_SPECS",
     "NVFP4",
-    "NVFP4_MLP_LAYERS",
     "NVFP4_TENSOR_SPECS",
     "OBJECT_SPECS",
     "Q4",
     "Q5",
     "Q6",
     "RESOURCE_SPECS",
-    "ROW_SCALE_LAYOUT",
     "ROW_SPLIT_LAYOUT",
+    "ROW_SCALE_LAYOUT",
     "ResourceSpec",
     "StoredObjectSpec",
     "TARGET_KEY",
@@ -452,6 +487,8 @@ __all__ = [
     "TensorSpec",
     "VISION_TENSOR_SPECS",
     "W8",
+    "W8_TENSOR_SPECS",
+    "WEIGHTS_ID",
     "tensor_spec",
     "validate_inventory",
 ]

@@ -32,6 +32,17 @@ Binder::Binder(const Reader& reader, int device_count, bool storage_only)
 
 bool Binder::has_tensor(std::string_view name) const noexcept { return reader_.find(name) != nullptr; }
 
+bool Binder::has_tensor(std::string_view name, NumericFormat format,
+                        std::span<const std::uint64_t> shape) const noexcept {
+    const ObjectDescriptor* object = reader_.find(name);
+    if (object == nullptr) { return false; }
+    const auto* tensor = std::get_if<TensorDescriptor>(object);
+    if (tensor == nullptr || tensor->format != format || tensor->shape.size() != shape.size()) {
+        return false;
+    }
+    return std::equal(tensor->shape.begin(), tensor->shape.end(), shape.begin(), shape.end());
+}
+
 void Binder::set_shard_resolver(ShardResolver resolver) {
     if (!materialization_.device_objects.empty() || device_mask_resolver_) {
         throw ArtifactError("the shard resolver must be installed before any tensor is placed");

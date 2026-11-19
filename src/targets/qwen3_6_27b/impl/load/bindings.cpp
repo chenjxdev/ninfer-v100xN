@@ -429,12 +429,23 @@ void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out,
                                   NumericFormat matrix_format) {
     const bool ggml_k = matrix_format == NumericFormat::GGML_K;
     const bool full_nvfp4 = matrix_format == NumericFormat::NVFP4;
+    // Mixed-storage artifacts (an NVFP4 checkpoint such as NVIDIA QAD whose attention quads are
+    // ModelOpt FP8) may store ANY projection as either NVFP4 -- paired with its
+    // input_scale_divisor object, exactly like the full-NVFP4 profile -- or the profile's matrix
+    // format; the v3 reader admits both per object, so each projection binds by its stored
+    // format instead of a profile-wide or layer-index rule.
     const auto bind_projection = [&](const std::string& name, std::int32_t rows,
                                       std::int32_t columns, const std::string& divisor) {
-        return full_nvfp4 ? bind_nvfp4_weight(binder, name, rows, columns, divisor)
-                          : bind_weight(binder, name, matrix_format,
-                              {static_cast<std::uint64_t>(rows),
-                               static_cast<std::uint64_t>(columns)});
+        const std::array<std::uint64_t, 2> shape{static_cast<std::uint64_t>(rows),
+                                                 static_cast<std::uint64_t>(columns)};
+        if (full_nvfp4 ||
+            binder.has_tensor(name, NumericFormat::NVFP4,
+                              std::span<const std::uint64_t>(shape.data(), shape.size()))) {
+            return bind_nvfp4_weight(binder, name, rows, columns, divisor);
+        }
+        return bind_weight(binder, name, matrix_format,
+                           {static_cast<std::uint64_t>(rows),
+                            static_cast<std::uint64_t>(columns)});
     };
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
@@ -478,16 +489,15 @@ void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out,
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
-        if (full_nvfp4 || (matrix_format == NumericFormat::FP8_E4M3FN_ROW_BF16S && layer < 56)) {
-            target.mlp.gate_up =
-                bind_nvfp4_weight(binder, prefix + "mlp/gate_up", 34816, 5120,
-                                  prefix + "mlp/gate_up_projection/input_scale_divisor");
-            target.mlp.down = bind_nvfp4_weight(binder, prefix + "mlp/down", 5120, 17408,
-                                                prefix + "mlp/down_projection/input_scale_divisor");
-        } else {
-            target.mlp.gate_up = bind_weight(binder, prefix + "mlp/gate_up", matrix_format, {34816, 5120});
-            target.mlp.down    = bind_weight(binder, prefix + "mlp/down", matrix_format, {5120, 17408});
-        }
+        // The same per-object format rule as the attention/GDN projections: NVFP4 when stored
+        // NVFP4 (official mixed artifacts keep layers 0..55 NVFP4; QAD keeps all 64), else the
+        // profile's matrix format.
+        target.mlp.gate_up =
+            bind_projection(prefix + "mlp/gate_up", 34816, 5120,
+                            prefix + "mlp/gate_up_projection/input_scale_divisor");
+        target.mlp.down =
+            bind_projection(prefix + "mlp/down", 5120, 17408,
+                            prefix + "mlp/down_projection/input_scale_divisor");
     }
 }
 
@@ -1012,9 +1022,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.frontend     = qwen3_6::bind_frontend_resources(binder);
     out.features     = features;
     const bool ggml_k = weights_profile == WeightsProfile::Qwen38GgmlK;
-    if (ggml_k && features.vision) {
-        throw std::invalid_argument("qwen3.8-27b/gguf-q4-k-m supports Text and MTP; its preserved GGUF Vision weights are not execution-qualified");
-    }
+    // ggml_k + vision is now allowed: the converter re-encodes the Vision tower
+    // into engine-native groupwise objects (vision/*) instead of preserved
+    // vision/gguf/* BF16 blobs.
     if (ggml_k) {
         out.draft_format = NumericFormat::GGML_K;
         out.mtp_format = NumericFormat::GGML_K;
@@ -1026,7 +1036,19 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         out.mtp_stem_format = NumericFormat::BF16;
     }
 
-    const NumericFormat vocabulary_format = endpoint_format(weights_profile);
+    NumericFormat vocabulary_format = endpoint_format(weights_profile);
+    // Mixed Qwen38Nvfp4 artifacts converted from NVFP4-source checkpoints keep the W8G32
+    // vocabulary endpoints of the full-NVFP4 profile (the v3 reader admits either endpoint
+    // pair); the official mixed layout stores row-scaled FP8 instead. Accept whichever pair
+    // the artifact actually stores.
+    if (weights_profile == WeightsProfile::Qwen38Nvfp4) {
+        static constexpr std::uint64_t kVocabShape[] = {248320, 5120};
+        const std::span<const std::uint64_t> vocab_shape(kVocabShape, 2);
+        if (binder.has_tensor("text/token_embedding", NumericFormat::W8G32_F16S, vocab_shape) &&
+            binder.has_tensor("text/output_head", NumericFormat::W8G32_F16S, vocab_shape)) {
+            vocabulary_format = NumericFormat::W8G32_F16S;
+        }
+    }
     out.token_embedding =
         bind_weight(binder, "text/token_embedding", vocabulary_format, {248320, 5120});
     switch (weights_profile) {
@@ -1150,9 +1172,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                                  : tp == 2 ? artifact::TensorPlacement::PrimaryDevice
                                    : artifact::TensorPlacement::Device)
                         : artifact::TensorPlacement::ValidateOnly;
-    if (ggml_k) {
-        binder.validate_unconsumed_matching("vision/gguf/");
-    } else if (!native_fp8) {
+    if (!native_fp8) {
     out.vision_backbone     = qwen3_6::bind_vision_backbone(binder, vision_placement);
     out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement);
     out.vision_merger_fc2   = artifact::bind_tensor(

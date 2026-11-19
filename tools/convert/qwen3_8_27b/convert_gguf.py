@@ -246,7 +246,111 @@ def json_bytes(value) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def frontend_resources(source: Gguf, vision: Gguf) -> dict[str, bytes]:
+# Vision tower: engine-native objects built from the mmproj GGUF.
+# Formats mirror qwen3_6's vision bindings: matrices in groupwise int
+# (row-split-k128-v1), vectors BF16 (contiguous-le-v1). The [N,K] convention
+# follows the GGUF reader (already reversed), so a GGUF tensor listed with
+# shape (K,N) is loaded as [N,K] directly.
+_VISION_ATTN_Q = "Q4G64_F16S"
+_VISION_ATTN_O = "Q5G64_F16S"
+_VISION_MLP_IN = "Q4G64_F16S"
+_VISION_MLP_OUT = "Q5G64_F16S"
+_VISION_PATCH = "Q6G64_F16S"
+_VISION_MERGER = "W8G32_F16S"
+
+
+def _vision_load(vision: Gguf, source_name: str) -> "torch.Tensor":
+    """Load one mmproj tensor as float32 with GGUF reader (reversed) dims."""
+    import torch
+
+    tensor = vision.tensors[source_name]
+    raw = bytearray(vision.payload(tensor))
+    if tensor.type == 0:
+        values = torch.frombuffer(raw, dtype=torch.float32)
+    elif tensor.type == 30:
+        values = torch.frombuffer(raw, dtype=torch.bfloat16)
+    else:
+        raise ValueError(f"{source_name}: expected F32 or BF16 vision source, got type {tensor.type}")
+    return values.reshape(tuple(tensor.shape)).float()
+
+
+def _vision_matrix(vision: Gguf, name: str, source_name: str, fmt: str,
+                   *, transpose: bool = False) -> DirectObject:
+    from tools.convert.common.quantize import quantize_and_encode
+
+    values = _vision_load(vision, source_name)
+    if transpose:
+        values = values.T.contiguous()
+    payload = quantize_and_encode(values, fmt)
+    n, k = values.shape
+    return DirectObject(TensorSpec(name, (n, k), fmt, "row-split-k128-v1", len(payload)),
+                        payload)
+
+
+def _vision_vector(vision: Gguf, name: str, source_name: str) -> DirectObject:
+    import torch
+
+    values = _vision_load(vision, source_name).reshape(-1)
+    payload = values.bfloat16().contiguous().view(torch.uint16).numpy().tobytes()
+    return DirectObject(TensorSpec(name, (values.numel(),), "BF16", "contiguous-le-v1"), payload)
+
+
+def build_vision_objects(vision: Gguf) -> list[DirectObject]:
+    """Engine-native vision objects from the 334-tensor mmproj GGUF.
+
+    The two Conv3d time taps (v.patch_embd.weight, v.patch_embd.weight.1) are
+    interleaved into one [1152,1536] patch embedding. GGUF lists each tap with
+    reader dims (16,16,3,1152) = gguf [out,3,16,16]; the engine wants
+    [out, K=3*2*16*16] with the channel layout [ch, tap, kh, kw].
+    """
+    import torch
+
+    from tools.convert.common.quantize import quantize_and_encode
+
+    def tap_channels(source_name: str) -> torch.Tensor:
+        t = _vision_load(vision, source_name)      # [out=1152, c=3, kh=16, kw=16]
+        out, c, kh, kw = t.shape
+        return t.reshape(out, c, kh * kw)          # [out, ch, khw]
+
+    tap0 = tap_channels("v.patch_embd.weight")
+    tap1 = tap_channels("v.patch_embd.weight.1")
+    kernel = torch.cat([tap0, tap1], dim=1).reshape(1152, 3 * 2 * 256)  # [out, ch*tap*khw]
+    patch_payload = quantize_and_encode(kernel, _VISION_PATCH)
+    objects = [DirectObject(TensorSpec("vision/patch_embedding", (1152, 1536),
+                                       _VISION_PATCH, "row-split-k128-v1", len(patch_payload)),
+                            patch_payload)]
+    objects.append(_vision_vector(vision, "vision/patch_embedding_bias", "v.patch_embd.bias"))
+
+    position = _vision_load(vision, "v.position_embd.weight")  # reader dims (2304,1152)->[1152,2304]
+    position = position.T.contiguous().bfloat16()
+    objects.append(DirectObject(
+        TensorSpec("vision/position_embedding", (2304, 1152), "BF16", "contiguous-le-v1"),
+        position.view(torch.uint16).numpy().tobytes()))
+
+    for layer in range(27):
+        prefix, p = f"vision/layers/{layer}/", f"v.blk.{layer}."
+        objects.append(_vision_matrix(vision, prefix + "attention/qkv", p + "attn_qkv.weight", _VISION_ATTN_Q))
+        objects.append(_vision_vector(vision, prefix + "attention/qkv_bias", p + "attn_qkv.bias"))
+        objects.append(_vision_matrix(vision, prefix + "attention/output", p + "attn_out.weight", _VISION_ATTN_O))
+        objects.append(_vision_vector(vision, prefix + "attention/output_bias", p + "attn_out.bias"))
+        objects.append(_vision_matrix(vision, prefix + "mlp/fc1", p + "ffn_up.weight", _VISION_MLP_IN))
+        objects.append(_vision_vector(vision, prefix + "mlp/fc1_bias", p + "ffn_up.bias"))
+        objects.append(_vision_matrix(vision, prefix + "mlp/fc2", p + "ffn_down.weight", _VISION_MLP_OUT))
+        objects.append(_vision_vector(vision, prefix + "mlp/fc2_bias", p + "ffn_down.bias"))
+        for role, target in (("ln1", "norm1"), ("ln2", "norm2")):
+            for part in ("weight", "bias"):
+                objects.append(_vision_vector(vision, f"{prefix}{target}/{part}", f"{p}{role}.{part}"))
+
+    objects.append(_vision_matrix(vision, "vision/merger/fc1", "mm.0.weight", _VISION_MERGER))
+    objects.append(_vision_vector(vision, "vision/merger/fc1_bias", "mm.0.bias"))
+    objects.append(_vision_matrix(vision, "vision/merger/fc2", "mm.2.weight", _VISION_MERGER))
+    objects.append(_vision_vector(vision, "vision/merger/fc2_bias", "mm.2.bias"))
+    objects.append(_vision_vector(vision, "vision/merger/norm/weight", "v.post_ln.weight"))
+    objects.append(_vision_vector(vision, "vision/merger/norm/bias", "v.post_ln.bias"))
+    return objects
+
+
+def frontend_resources(source: Gguf, vision: Gguf, chat_template_override: Path | None = None) -> dict[str, bytes]:
     metadata = source.metadata
     tokens, types = metadata["tokenizer.ggml.tokens"], metadata["tokenizer.ggml.token_type"]
     if len(tokens) != VOCAB_ROWS or len(types) != VOCAB_ROWS:
@@ -262,11 +366,20 @@ def frontend_resources(source: Gguf, vision: Gguf) -> dict[str, bytes]:
                 raise ValueError(f"token {index} has unsupported type {token_type}")
             added.append(dict(id=index, content=text, single_word=False, lstrip=False,
                               rstrip=False, normalized=False, special=token_type == 3))
-    template = metadata["tokenizer.chat_template"]
+    if chat_template_override is not None:
+        # nace-ai/Unsloth embed their own chat template; the engine's runtime only
+        # accepts registered template digests, so substitute the official file.
+        template = chat_template_override.read_text(encoding="utf-8")
+    else:
+        template = metadata["tokenizer.chat_template"]
     tokenizer = {"model": {"type": "BPE", "vocab": vocab,
                             "merges": metadata["tokenizer.ggml.merges"]}, "added_tokens": added}
+    # nace-ai exports padding_token_id = <|vision_pad|>; the engine's runtime
+    # frontend hard-requires the official <|endoftext|> pad token.
+    if "<|endoftext|>" not in tokens:
+        raise ValueError("source tokenizer has no <|endoftext|> token")
     config = {"add_bos_token": False, "add_prefix_space": False,
-              "pad_token": tokens[metadata["tokenizer.ggml.padding_token_id"]],
+              "pad_token": "<|endoftext|>",
               "chat_template": template,
               "added_tokens_decoder": {str(token["id"]): {k: v for k, v in token.items() if k != "id"}
                                        for token in added}}
@@ -443,22 +556,20 @@ def preflight(source: Gguf, vision: Gguf):
 
 
 def convert(model: Path, mmproj: Path, output: Path, ranking: Path, inspect_only=False,
-            dflash2_model: Path | None = None):
+            dflash2_model: Path | None = None, chat_template: Path | None = None):
     with Gguf(model) as source, Gguf(mmproj) as vision:
         preflight(source, vision)
-        resources = frontend_resources(source, vision)
+        resources = frontend_resources(source, vision, chat_template)
         objects = build_text_objects(source, ranking)
         if dflash2_model is not None:
             objects.extend(build_dflash2_objects(dflash2_model))
         specs = [ResourceSpec(name, "raw-bytes-v1", len(data)) for name, data in resources.items()]
         specs.extend(obj.spec for obj in objects)
-        vision_specs = [TensorSpec("vision/gguf/" + tensor.name, tensor.shape,
-                                   "BF16" if tensor.type == 30 else "FP32", "contiguous-le-v1")
-                        for tensor in vision.tensors.values()]
-        specs.extend(vision_specs)
+        vision_objects = build_vision_objects(vision)
+        specs.extend(obj.spec for obj in vision_objects)
         report = {"identity": {"model_id": IDENTITY.model_id, "weights_id": IDENTITY.weights_id},
                   "source": str(model.resolve()), "mmproj": str(mmproj.resolve()),
-                  "tensor_count": len(objects) + len(vision_specs), "resource_count": len(resources),
+                  "tensor_count": len(objects) + len(vision_objects), "resource_count": len(resources),
                   "source_formats": dict(Counter(t.type for t in source.tensors.values())),
                   "resource_sha256": {name: hashlib.sha256(data).hexdigest() for name, data in resources.items()},
                   "transforms": ["Q4_K and Q6_K block bytes preserved after row fusion and selection",
@@ -466,7 +577,7 @@ def convert(model: Path, mmproj: Path, output: Path, ranking: Path, inspect_only
                                  "A_log = FP32 log(-GGUF ssm_a); original exponential rounding is not invertible",
                                  "convolution transposed to tap-major and rounded to BF16",
                                  "GGUF token metadata reconstructed into six native frontend resources",
-                                 "Vision GGUF tensors retained unchanged; Vision execution disabled"]}
+                                 "Vision tower re-encoded engine-native: Q4/Q5/Q6G64 + W8G32 matrices, BF16 vectors"]}
         if inspect_only:
             print(json.dumps(report, indent=2))
             return report
@@ -478,8 +589,10 @@ def convert(model: Path, mmproj: Path, output: Path, ranking: Path, inspect_only
                 writer.write(obj.spec.name, obj.chunks(source) if isinstance(obj, QuantObject) else obj.data)
                 if index % 32 == 0:
                     print(f"[{index + 1}/{len(objects)}] {obj.spec.name}", flush=True)
-            for spec, tensor in zip(vision_specs, vision.tensors.values()):
-                writer.write(spec.name, vision.payload(tensor))
+            for index, obj in enumerate(vision_objects):
+                writer.write(obj.spec.name, obj.data)
+                if index % 32 == 0:
+                    print(f"[vision {index + 1}/{len(vision_objects)}] {obj.spec.name}", flush=True)
         report["output_bytes"] = output.stat().st_size
         report_path = output.with_name(output.name + ".conversion.json")
         report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
@@ -496,8 +609,11 @@ def main():
     parser.add_argument("--inspect-only", action="store_true")
     parser.add_argument("--dflash2-model", type=Path,
                         help="Qwen3.8-27B-DFlash2 safetensors directory")
+    parser.add_argument("--chat-template", type=Path,
+                        help="Override the GGUF-embedded chat template (engine-registered file)")
     args = parser.parse_args()
-    convert(args.model, args.mmproj, args.out, args.ranking, args.inspect_only, args.dflash2_model)
+    convert(args.model, args.mmproj, args.out, args.ranking, args.inspect_only, args.dflash2_model,
+            args.chat_template)
 
 
 if __name__ == "__main__":

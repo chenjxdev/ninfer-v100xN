@@ -404,8 +404,14 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
                                                                    std::int32_t last) {
     validate_token_interval(first, last);
     if (tp == 4) {
-        return ops::attn_input_proj_column_parallel_workspace_capacity_bytes(
-            tp4_projection_type(weights_profile), ops::LinearPolicy::A16Only, first, last, tp);
+        const QType qtype = tp4_projection_type(weights_profile);
+        std::size_t bytes = ops::attn_input_proj_column_parallel_workspace_capacity_bytes(
+            qtype, ops::LinearPolicy::A16Only, first, last, tp);
+        if (weights_profile == WeightsProfile::Qwen38Nvfp4) {
+            bytes = std::max(bytes, ops::attn_input_proj_column_parallel_workspace_capacity_bytes(
+                                        QType::NVFP4, ops::LinearPolicy::A16Only, first, last, tp));
+        }
+        return bytes;
     }
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
@@ -423,8 +429,14 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::NVFP4, 14336, TextConfig::hidden, kNvfp4TextPolicy, first, last);
     case WeightsProfile::Qwen38Nvfp4:
-        return ops::attn_input_proj_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16S, 14336, TextConfig::hidden, kFp8TextPolicy, first, last);
+        // Mixed storage: any projection may be NVFP4 or row-scaled FP8 (same
+        // treatment as post_mixer below); size the shared workspace for the
+        // larger of the two formats.
+        return std::max(
+            ops::attn_input_proj_workspace_capacity_bytes(
+                QType::FP8_E4M3FN_ROW_BF16S, 14336, TextConfig::hidden, kFp8TextPolicy, first, last),
+            ops::attn_input_proj_workspace_capacity_bytes(
+                QType::NVFP4, 14336, TextConfig::hidden, kNvfp4TextPolicy, first, last));
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -433,9 +445,17 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     WeightsProfile weights_profile, int tp, qwen3_6::TextPhase, std::int32_t first, std::int32_t last) {
     validate_token_interval(first, last);
     if (tp == 4) {
-        return ops::linear_add_workspace_capacity_bytes(
-            tp4_projection_type(weights_profile), TextConfig::hidden, TextConfig::query_size / tp,
+        const QType qtype = tp4_projection_type(weights_profile);
+        std::size_t bytes = ops::linear_add_workspace_capacity_bytes(
+            qtype, TextConfig::hidden, TextConfig::query_size / tp,
             ops::LinearPolicy::A16Only, first, last);
+        if (weights_profile == WeightsProfile::Qwen38Nvfp4) {
+            bytes = std::max(bytes, ops::linear_add_workspace_capacity_bytes(
+                                        QType::NVFP4, TextConfig::hidden,
+                                        TextConfig::query_size / tp, ops::LinearPolicy::A16Only,
+                                        first, last));
+        }
+        return bytes;
     }
     switch (weights_profile) {
     case WeightsProfile::Qwen38Fp8:
@@ -456,9 +476,14 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
                                                         TextConfig::query_size, kNvfp4TextPolicy,
                                                         first, last);
     case WeightsProfile::Qwen38Nvfp4:
-        return ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
-                                                        TextConfig::hidden, TextConfig::query_size,
-                                                        kFp8TextPolicy, first, last);
+        // Mixed storage: NVFP4 or row-scaled FP8 per projection; size for the larger.
+        return std::max(
+            ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
+                                                     TextConfig::hidden, TextConfig::query_size,
+                                                     kFp8TextPolicy, first, last),
+            ops::linear_add_workspace_capacity_bytes(QType::NVFP4, TextConfig::hidden,
+                                                     TextConfig::query_size, kNvfp4TextPolicy,
+                                                     first, last));
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -469,8 +494,14 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
                                                                    std::int32_t last) {
     validate_token_interval(first, last);
     if (tp == 4) {
-        return ops::gdn_input_proj_column_parallel_workspace_capacity_bytes(
-            tp4_projection_type(weights_profile), ops::LinearPolicy::A16Only, first, last, tp);
+        const QType qtype = tp4_projection_type(weights_profile);
+        std::size_t bytes = ops::gdn_input_proj_column_parallel_workspace_capacity_bytes(
+            qtype, ops::LinearPolicy::A16Only, first, last, tp);
+        if (weights_profile == WeightsProfile::Qwen38Nvfp4) {
+            bytes = std::max(bytes, ops::gdn_input_proj_column_parallel_workspace_capacity_bytes(
+                                        QType::NVFP4, ops::LinearPolicy::A16Only, first, last, tp));
+        }
+        return bytes;
     }
     switch (weights_profile) {
     case WeightsProfile::Qwen38Fp8:
@@ -487,8 +518,12 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
         return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 16384, TextConfig::hidden,
                                                             kNvfp4TextPolicy, first, last);
     case WeightsProfile::Qwen38Nvfp4:
-        return ops::gdn_input_proj_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy, first, last);
+        // Mixed storage: NVFP4 or row-scaled FP8 per projection; size for the larger.
+        return std::max(
+            ops::gdn_input_proj_workspace_capacity_bytes(
+                QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy, first, last),
+            ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 16384, TextConfig::hidden,
+                                                         kNvfp4TextPolicy, first, last));
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -498,9 +533,16 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
     std::int32_t last) {
     validate_token_interval(first, last);
     if (tp == 4) {
-        return ops::gdn_input_proj_conv_snapshot_column_parallel_workspace_capacity_bytes(
-            tp4_projection_type(weights_profile), ops::LinearPolicy::A16Only, batch_size, first,
-            last, tp);
+        const QType qtype = tp4_projection_type(weights_profile);
+        std::size_t bytes =
+            ops::gdn_input_proj_conv_snapshot_column_parallel_workspace_capacity_bytes(
+                qtype, ops::LinearPolicy::A16Only, batch_size, first, last, tp);
+        if (weights_profile == WeightsProfile::Qwen38Nvfp4) {
+            bytes = std::max(
+                bytes, ops::gdn_input_proj_conv_snapshot_column_parallel_workspace_capacity_bytes(
+                           QType::NVFP4, ops::LinearPolicy::A16Only, batch_size, first, last, tp));
+        }
+        return bytes;
     }
     switch (weights_profile) {
     case WeightsProfile::Qwen38Fp8:
@@ -526,10 +568,15 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
                             QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch_size,
                             first, last));
     case WeightsProfile::Qwen38Nvfp4:
+        // Mixed storage: NVFP4 or row-scaled FP8 per projection; size for the larger.
         return std::max(kMinimumLeafWorkspaceBytes,
-                        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                            QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy,
-                            batch_size, first, last));
+                        std::max(
+                            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                                QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden,
+                                kFp8TextPolicy, batch_size, first, last),
+                            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                                QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy,
+                                batch_size, first, last)));
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -539,10 +586,20 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
     std::int32_t last) {
     validate_token_interval(first, last);
     if (tp == 4) {
-        return std::max(kMinimumLeafWorkspaceBytes,
-                        ops::gdn_input_proj_conv_record_column_parallel_workspace_capacity_bytes(
-                            tp4_projection_type(weights_profile), ops::LinearPolicy::A16Only,
-                            batch_size, first, last, tp));
+        const QType qtype = tp4_projection_type(weights_profile);
+        std::size_t bytes = std::max(
+            kMinimumLeafWorkspaceBytes,
+            ops::gdn_input_proj_conv_record_column_parallel_workspace_capacity_bytes(
+                qtype, ops::LinearPolicy::A16Only, batch_size, first, last, tp));
+        if (weights_profile == WeightsProfile::Qwen38Nvfp4) {
+            bytes = std::max(
+                bytes, std::max(
+                           kMinimumLeafWorkspaceBytes,
+                           ops::gdn_input_proj_conv_record_column_parallel_workspace_capacity_bytes(
+                               QType::NVFP4, ops::LinearPolicy::A16Only, batch_size, first, last,
+                               tp)));
+        }
+        return bytes;
     }
     switch (weights_profile) {
     case WeightsProfile::Qwen38Fp8:
@@ -568,10 +625,15 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
                             QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch_size,
                             first, last));
     case WeightsProfile::Qwen38Nvfp4:
+        // Mixed storage: NVFP4 or row-scaled FP8 per projection; size for the larger.
         return std::max(kMinimumLeafWorkspaceBytes,
-                        ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-                            QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy,
-                            batch_size, first, last));
+                        std::max(
+                            ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                                QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden,
+                                kFp8TextPolicy, batch_size, first, last),
+                            ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                                QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy,
+                                batch_size, first, last)));
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -582,9 +644,17 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
                                                                     std::int32_t last) {
     validate_token_interval(first, last);
     if (tp == 4) {
-        return ops::linear_add_workspace_capacity_bytes(
-            tp4_projection_type(weights_profile), TextConfig::hidden, TextConfig::value_dim / tp,
+        const QType qtype = tp4_projection_type(weights_profile);
+        std::size_t bytes = ops::linear_add_workspace_capacity_bytes(
+            qtype, TextConfig::hidden, TextConfig::value_dim / tp,
             ops::LinearPolicy::A16Only, first, last);
+        if (weights_profile == WeightsProfile::Qwen38Nvfp4) {
+            bytes = std::max(bytes, ops::linear_add_workspace_capacity_bytes(
+                                        QType::NVFP4, TextConfig::hidden,
+                                        TextConfig::value_dim / tp, ops::LinearPolicy::A16Only,
+                                        first, last));
+        }
+        return bytes;
     }
     switch (weights_profile) {
     case WeightsProfile::Qwen38Fp8:
@@ -604,9 +674,14 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
         return ops::linear_add_workspace_capacity_bytes(
             QType::NVFP4, TextConfig::hidden, TextConfig::value_dim, kNvfp4TextPolicy, first, last);
     case WeightsProfile::Qwen38Nvfp4:
-        return ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
-                                                        TextConfig::hidden, TextConfig::value_dim,
-                                                        kFp8TextPolicy, first, last);
+        // Mixed storage: NVFP4 or row-scaled FP8 per projection; size for the larger.
+        return std::max(
+            ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
+                                                     TextConfig::hidden, TextConfig::value_dim,
+                                                     kFp8TextPolicy, first, last),
+            ops::linear_add_workspace_capacity_bytes(QType::NVFP4, TextConfig::hidden,
+                                                     TextConfig::value_dim, kNvfp4TextPolicy,
+                                                     first, last));
     }
     throw std::logic_error("invalid 27B weights profile");
 }

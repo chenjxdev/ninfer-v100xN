@@ -120,6 +120,12 @@ public:
     // targets use this read-only probe to bind them only when the startup feature selects them.
     [[nodiscard]] bool has_tensor(std::string_view name) const noexcept;
 
+    // Read-only probe of a stored tensor's exact format and shape without consuming it.
+    // Targets whose per-object storage format may vary inside one weights profile
+    // (mixed NVFP4 / row-scaled FP8 projections) use this to choose the bind call.
+    [[nodiscard]] bool has_tensor(std::string_view name, NumericFormat format,
+                                  std::span<const std::uint64_t> shape) const noexcept;
+
     void set_shard_resolver(ShardResolver resolver);
     void set_device_mask_resolver(DeviceMaskResolver resolver);
 

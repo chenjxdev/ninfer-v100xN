@@ -52,3 +52,4 @@ profiles/
 
 # Generated release packages and Docker exports
 dist/
+pkg/
