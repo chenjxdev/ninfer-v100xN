@@ -63,6 +63,8 @@ struct VisionItem {
 
 struct PreprocessStats {
     std::size_t media_items              = 0;
+    std::size_t degraded_media_items     = 0;
+    std::size_t dropped_media_items      = 0;
     std::size_t media_bytes              = 0;
     std::uint64_t raw_patches            = 0;
     std::uint64_t vision_tokens          = 0;
@@ -84,6 +86,8 @@ struct PreprocessStats {
 struct ProcessorOptions {
     std::uint64_t image_min_pixels = 32ULL * 32ULL;
     std::uint64_t image_max_pixels = 1024ULL * 1024ULL;
+    // Oldest-image shrink ceiling when a multi-image request exceeds the Vision token budget.
+    std::uint64_t degraded_image_max_pixels = 64ULL * 32ULL * 32ULL;
     std::uint64_t video_min_pixels = 128ULL * 32ULL * 32ULL;
     std::uint64_t video_max_pixels = 4ULL * 1024ULL * 1024ULL;
     // Encoded bytes are aggregate per prompt. Decode limits are per item; the fixed worker pool

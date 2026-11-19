@@ -22,7 +22,7 @@ namespace ninfer::serve {
 // (artifact_type, schema_version, event) tuple for exact equality, so a bump breaks every campaign
 // tool until they are updated in lockstep. Precedent on this branch: `e4a2cac` added five rope
 // fields to `server_start.engine` without a bump, as did the `tp`/`devices` pair after it.
-inline constexpr int kRequestLogSchemaVersion        = 10;
+inline constexpr int kRequestLogSchemaVersion        = 11;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct RequestLogContext {

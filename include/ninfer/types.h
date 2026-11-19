@@ -366,6 +366,8 @@ struct PromptPreparationStats {
     double media_preprocess_work_seconds = 0.0;
     double tokenize_seconds              = 0.0;
     std::size_t media_items              = 0;
+    std::size_t degraded_media_items     = 0;
+    std::size_t dropped_media_items      = 0;
     std::size_t media_bytes              = 0;
     std::uint64_t raw_patches            = 0;
     std::uint64_t vision_tokens          = 0;
