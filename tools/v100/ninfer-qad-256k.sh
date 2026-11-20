@@ -20,7 +20,8 @@
 #                           almost nothing.  Token output is identical.
 #   --vision-device cpu     Keeps the Vision tower in host memory.  Decode is unaffected
 #                           (the tower is not on the text path) and it frees ~0.4 GiB of
-#                           device memory for the KV budget.
+#                           device memory for the KV budget.  Move the tower back to the
+#                           GPU by using the smaller gguf-q4-k-m artifact instead.
 #   --vision-max-tokens 4096  Full image fidelity.  Lowering this is the other way to
 #                           buy memory, at the cost of image detail.
 #
@@ -29,11 +30,22 @@
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-repo_dir=$(cd -- "${script_dir}/../.." && pwd)
+repo_dir=$(cd -- "${script_dir}/../.." && pwd 2>/dev/null || echo "")
 
-executable=${NINFER_QAD_EXECUTABLE:-"${repo_dir}/pkg/libexec/ninfer-serve"}
+# The engine lives in <repo>/pkg when run from the checkout, and in the lab tree
+# when this launcher is copied next to the artifact.
+pick_dir() {
+  local rel="$1" fallback="$2"
+  if [ -n "${repo_dir}" ] && [ -d "${repo_dir}/${rel}" ]; then
+    printf '%s' "${repo_dir}/${rel}"
+  else
+    printf '%s' "${fallback}"
+  fi
+}
+
+executable=${NINFER_QAD_EXECUTABLE:-"$(pick_dir pkg/libexec/ninfer-serve /home/chenjx/ninfer-jack/pkg/libexec/ninfer-serve)"}
 artifact=${NINFER_QAD_ARTIFACT:-/data/models/qwen3_8_27b_nvfp4.ninfer}
-lib_dir=${NINFER_QAD_LIB_DIR:-"${repo_dir}/pkg/lib"}
+lib_dir=${NINFER_QAD_LIB_DIR:-"$(pick_dir pkg/lib /home/chenjx/ninfer-jack/pkg/lib)"}
 host=${NINFER_QAD_HOST:-172.16.3.88}
 port=${NINFER_QAD_PORT:-8080}
 devices=${NINFER_QAD_DEVICES:-1,0}
