@@ -110,7 +110,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     // RestorePrefixCheckpoint. Historical host KV archive stays Text-only
     // (see history_enabled at admit). Sticky media floors keep append-stable tokens.
     base->capture_prefix_checkpoints = options.allow_prefix_reuse && prompt.identity.reusable &&
-        ram_kv.gpu_tokens == 0 &&
+        !prompt.has_media() && !kvmem.enabled() && ram_kv.gpu_tokens == 0 &&
         speculative_backend != SpeculativeBackend::DFlash &&
         prefix_checkpoint_bytes() <= kPrefixCheckpointBudget / max_concurrency;
     if (options.prefix_pin_tokens != 0) {
@@ -132,7 +132,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     } else if (speculative_backend == SpeculativeBackend::DFlash && backend_kv_cache() != nullptr) {
         base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     }
-    if (ram_kv.gpu_tokens != 0) {
+    if (kvmem.enabled()) {
         base->text_kv_page_entitlement = decoder->text_kv.pool().page_group_count();
         base->backend_kv_page_entitlement = decoder->mtp_cache() != nullptr
             ? std::min(decoder->mtp_cache()->pool().page_group_count(), pages_for_tokens(capacity)) : 0U;
@@ -233,8 +233,11 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
         // A shorter/edited prompt can still claim any retained complete state image.
         // Prefer the longest matching frontier, not the checkpoint's original purpose.
-        // Vision is included for lane-local images; historical sibling archive stays Text-only.
-        if (ram_kv.gpu_tokens == 0 && speculative_backend != SpeculativeBackend::DFlash) {
+        // The historical sibling archive is Text-only, so a media prompt cannot
+        // match it; and when RAM-KV or kvmem owns the KV pages, restoring a
+        // prefix checkpoint would fight that owner for the same budget.
+        if (!prompt.has_media() && !kvmem.enabled() && ram_kv.gpu_tokens == 0 &&
+            speculative_backend != SpeculativeBackend::DFlash) {
             for (const auto& checkpoint : sequence.prefix_checkpoints) {
                 if (checkpoint.frontier > plan->reuse_base &&
                     qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
