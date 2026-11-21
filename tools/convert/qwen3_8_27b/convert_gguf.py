@@ -314,7 +314,13 @@ def build_vision_objects(vision: Gguf) -> list[DirectObject]:
 
     tap0 = tap_channels("v.patch_embd.weight")
     tap1 = tap_channels("v.patch_embd.weight.1")
-    kernel = torch.cat([tap0, tap1], dim=1).reshape(1152, 3 * 2 * 256)  # [out, ch*tap*khw]
+    # The engine wants [ch, tap, kh, kw] -- the native Conv3d layout of the
+    # checkpoint's patch projection -- so the two taps interleave per channel.
+    # A tap-major concatenation keeps the spatial structure but mixes the RGB
+    # channels into the temporal taps: the model then loses colour entirely
+    # while still recognizing shapes.
+    kernel = torch.stack([tap0, tap1], dim=2)      # [out, ch, tap, khw]
+    kernel = kernel.reshape(1152, 3 * 2 * 256)      # [out, ch*tap*khw]
     patch_payload = quantize_and_encode(kernel, _VISION_PATCH)
     objects = [DirectObject(TensorSpec("vision/patch_embedding", (1152, 1536),
                                        _VISION_PATCH, "row-split-k128-v1", len(patch_payload)),
