@@ -814,11 +814,13 @@ void for_each_rank(const ExecutionContext& ec, Body&& body) {
     }
 }
 
-// Both registered MTP codecs use A16 projections without transient Linear storage.
+// The registered MTP codecs use A16 projections without transient Linear storage.
+// Q4G64_F16S joins them for the compressed-MTP layout: the tp2 MTP leaves are plain
+// `linear` calls issued with LinearPolicy::A16Only, which the Q4 launcher serves.
 void require_mtp_shard(const Weight& a, const Weight& b, const char* label) {
     if (a.qtype != b.qtype ||
         (a.qtype != QType::W8G32_F16S && a.qtype != QType::GGML_K &&
-         a.qtype != QType::FP8_E4M3FN_BLOCK128_BF16S)) {
+         a.qtype != QType::Q4G64_F16S && a.qtype != QType::FP8_E4M3FN_BLOCK128_BF16S)) {
         throw std::logic_error(std::string(label) +
                                ": unsupported or inconsistent tp2 MTP weight format");
     }

@@ -1,25 +1,36 @@
-"""Build the Qwen3.8-27B mixed NVFP4/FP8 artifact from the NVIDIA QAD checkpoint.
+"""Build the Qwen3.8-27B mixed NVFP4/FP8 artifact from a ModelOpt checkpoint.
 
-Canonical invocation::
+Canonical invocations::
 
     python3 -m tools.convert.qwen3_8_27b.convert_nvfp4 \
       --model /data/models/nvidia-qad \
-      --out /data/models/qwen3_8_27b_nvfp4.ninfer
+      --out /data/models/qwen3_8_27b_q4km_v2.ninfer
 
-Single quantized source (NVIDIA ModelOpt 0.46 NVFP4 QAD): the 204 NVFP4
-text projections are byte passthroughs (weight_scale_2 omitted by QAD
-reads as the multiplier 1.0) and the 52 FP8 attention objects (94
-ModelOpt FP8 source quads: every full-attention layer's qkv/o plus ten
-GDN layers' qkvz/o) pass through as row-scaled FP8, per-row BF16 scales
-broadcast from the per-tensor F32 weight_scale -- code words stay
-bit-identical, no requantization. Unlike the Huihui round the lm_head is
-itself NVFP4-quantized: QadSourceReader dequantizes it to BF16
+    NINFER_NVFP4_SOURCE=daisyrose python3 -m tools.convert.qwen3_8_27b.convert_nvfp4 \
+      --model /data/models/daisyrose-27b-nvfp4 \
+      --out /data/models/daisyrose_27b_nvfp4_q6head_q4mtp.ninfer
+
+The source profile (tools.convert.qwen3_8_27b.source_profile) selects the
+checkpoint and its expectations; it is read from NINFER_NVFP4_SOURCE before
+this module is imported.
+
+One quantized source, one artifact, no patching round: the 204 NVFP4 text
+projections are byte passthroughs (a QAD weight_scale_2 omitted for a
+multiplier of 1.0 reads as exactly 1.0) and the 52 FP8 attention objects
+pass through as row-scaled FP8, per-row BF16 scales broadcast from the
+per-tensor F32 weight_scale -- code words stay bit-identical, no
+requantization. A source that exported a layer as ModelOpt FP8 but the
+artifact stores as NVFP4 (DaisyRose exports every GDN layer that way, the
+production profile keeps thirty-eight of them as NVFP4) is dequantized and
+requantized to NVFP4 instead. Unlike the Huihui round the lm_head is itself
+NVFP4-quantized: QadSourceReader dequantizes it to BF16
 (W = e2m1 * f32(weight_scale) * weight_scale_2, engine nibble order)
-before W8 quantization and the draft-head row gather. The QAD export
-ships only the 11 MTP layer tensors; the four remaining MTP objects are
-read from the auxiliary Huihui checkpoint. Frontend resources are taken
-verbatim from the source directory. The artifact lands in the mixed
-``Qwen38Nvfp4`` weights profile (weights_id "nvfp4").
+before grouped quantization and the draft-head row gather. The QAD export
+ships only the 11 MTP layer tensors, so the four remaining MTP objects are
+read from the auxiliary Huihui checkpoint; a source that ships them itself
+needs no auxiliary checkpoint. Frontend resources are taken verbatim from the
+source directory. The artifact lands in the mixed ``Qwen38Nvfp4`` weights
+profile (weights_id "nvfp4").
 """
 
 from __future__ import annotations
@@ -51,23 +62,28 @@ from tools.convert.qwen3_6_27b import draft_head
 
 from . import inventory_nvfp4 as inventory
 from . import recipe_nvfp4 as recipe
+from . import source_profile
 
 
-RECIPE_ID = "qwen3_8_27b_nvfp4-v4-nvidia-qad-fp8attn"
-OUTPUT_BASENAME = "qwen3_8_27b_nvfp4.ninfer"
+# Each source profile is a closed recipe: its own recipe id, its own output
+# name and its own MTP source. The artifact's name must match the one the
+# conversion accepts.
+RECIPE_IDS = {
+    "qad": "qwen3_8_27b_nvfp4-v5-nvidia-qad-q4mtp-q6emb-w8head",
+    "daisyrose": "qwen3_8_27b_nvfp4-v5-radixark-daisyrose-27b-q4mtp-q6emb-q6head",
+}
+OUTPUT_BASENAMES = {
+    "qad": "qwen3_8_27b_q4km_v2.ninfer",
+    "daisyrose": "daisyrose_27b_nvfp4_q6emb_q6head_q4mtp.ninfer",
+}
+RECIPE_ID = RECIPE_IDS[source_profile.ACTIVE.name]
+OUTPUT_BASENAME = OUTPUT_BASENAMES[source_profile.ACTIVE.name]
 
-AUXILIARY_MTP_REPOSITORY = (
-    "/data/models/KatterMobile/"
-    "Huihui-Qwen3.8-27B-Coder390-EfficientThink-abliterated-NVFP4-QAT"
-)
 # The QAD export ships only the 11 MTP layer tensors; these four BF16
-# objects are read verbatim from the auxiliary Huihui checkpoint.
-AUXILIARY_MTP_FIELDS = (
-    "mtp.fc.weight",
-    "mtp.pre_fc_norm_embedding.weight",
-    "mtp.pre_fc_norm_hidden.weight",
-    "mtp.norm.weight",
-)
+# objects are read verbatim from the auxiliary Huihui checkpoint. A source
+# that ships them itself (DaisyRose) needs no auxiliary checkpoint.
+AUXILIARY_MTP_REPOSITORY = source_profile.ACTIVE.mtp_auxiliary
+AUXILIARY_MTP_FIELDS = source_profile.ACTIVE.mtp_auxiliary_fields
 LM_HEAD_WEIGHT = "lm_head.weight"
 LM_HEAD_QUAD_FIELDS = (
     LM_HEAD_WEIGHT,
@@ -128,10 +144,10 @@ class QadSourceReader:
     def __init__(
         self,
         quantized_dir: str | Path,
-        auxiliary_dir: str | Path = AUXILIARY_MTP_REPOSITORY,
+        auxiliary_dir: str | Path | None = AUXILIARY_MTP_REPOSITORY,
     ) -> None:
         self._reader = ShardReader(quantized_dir)
-        self._auxiliary_dir = Path(auxiliary_dir)
+        self._auxiliary_dir = Path(auxiliary_dir) if auxiliary_dir else None
         self._auxiliary = None
         self._auxiliary_metadata = None
         self._lm_head = None
@@ -141,11 +157,12 @@ class QadSourceReader:
         base = set(self._reader.names)
         base.difference_update(LM_HEAD_QUAD_FIELDS)
         base.add(LM_HEAD_WEIGHT)
-        base.update(AUXILIARY_MTP_FIELDS)
+        if self._auxiliary_dir is not None:
+            base.update(AUXILIARY_MTP_FIELDS)
         return tuple(sorted(base))
 
     def has(self, name: str) -> bool:
-        if name in AUXILIARY_MTP_FIELDS:
+        if self._auxiliary_dir is not None and name in AUXILIARY_MTP_FIELDS:
             return True
         if name in LM_HEAD_QUAD_FIELDS:
             return name == LM_HEAD_WEIGHT
@@ -156,7 +173,7 @@ class QadSourceReader:
             if self._lm_head is None:
                 self._lm_head = self._materialize_lm_head()
             return self._lm_head
-        if name in AUXILIARY_MTP_FIELDS:
+        if self._auxiliary_dir is not None and name in AUXILIARY_MTP_FIELDS:
             if self._auxiliary is None:
                 self._auxiliary = ShardReader(self._auxiliary_dir)
             return self._auxiliary.get(name)
@@ -171,7 +188,7 @@ class QadSourceReader:
         result = dict(self._reader.metadata(plain)) if plain else {}
         virtual = [name for name in names if name not in result]
         if virtual:
-            if self._auxiliary_metadata is None:
+            if self._auxiliary_metadata is None and self._auxiliary_dir is not None:
                 if self._auxiliary is None:
                     self._auxiliary = ShardReader(self._auxiliary_dir)
                 self._auxiliary_metadata = self._auxiliary.metadata(
@@ -185,7 +202,7 @@ class QadSourceReader:
                         shape=(LM_HEAD_ROWS, LM_HEAD_COLS),
                         dtype="BF16",
                     )
-                elif name in AUXILIARY_MTP_FIELDS:
+                elif name in AUXILIARY_MTP_FIELDS and self._auxiliary_metadata is not None:
                     result[name] = self._auxiliary_metadata[name]
                 else:
                     raise KeyError(name)
@@ -399,13 +416,13 @@ def _encode_fp8_weight(
     return encode_fp8_row_scaled(codes, row_scales, spec.shape)
 
 
-def _encode_w8_weight(
+def _encode_grouped_weight(
     spec: inventory.TensorSpec,
     reader: ShardReader,
     device: torch.device,
 ) -> bytes:
-    selected = recipe.W8_WEIGHTS_BY_NAME[spec.name]
-    fused = recipe.materialize_w8_weight(selected, reader)
+    selected = recipe.GROUPED_WEIGHTS_BY_NAME[spec.name]
+    fused = recipe.materialize_grouped_weight(selected, reader)
     payload = family_conversion.encode_tensor_payload(fused, spec, device)
     del fused
     return payload
@@ -471,7 +488,9 @@ def _build_report(
             "model_path": str(preflight.quantized_dir.resolve()),
         },
         "auxiliary_mtp": {
-            "model_path": str(Path(auxiliary_dir).resolve()),
+            "model_path": (
+                str(Path(auxiliary_dir).resolve()) if auxiliary_dir else None
+            ),
             "fields": list(AUXILIARY_MTP_FIELDS),
         },
         "ranking_path": str(ranking.resolve()),
@@ -496,13 +515,20 @@ def convert(
         )
     requested_device = str(device)
     resolved_device = pick_device(device)
-    preflight = preflight_conversion(quantized_dir)
+    preflight = preflight_conversion(quantized_dir, auxiliary_dir)
 
     print(
+        f"source profile: {source_profile.ACTIVE.name} "
+        f"({source_profile.ACTIVE.repository} @ "
+        f"{source_profile.ACTIVE.revision})",
+        flush=True,
+    )
+    print(
         f"preflight complete: {len(preflight.object_plan.objects)} objects, "
-        f"{len(recipe.NVFP4_SOURCES)} NVFP4 quads, "
+        f"{len(recipe.NVFP4_SOURCES)} NVFP4 quads "
+        f"({len(recipe.REQUANTIZED_SOURCES)} requantized from FP8), "
         f"{len(recipe.FP8_SOURCES)} FP8 quads and "
-        f"{len(recipe.W8_SOURCES)} W8 BF16 sources, "
+        f"{len(recipe.GROUPED_SOURCES)} grouped BF16 sources, "
         f"device={resolved_device}",
         flush=True,
     )
@@ -536,8 +562,8 @@ def convert(
                         quantized_reader,
                     )
                     payload = encode_direct(scalar, inventory.FP32)
-                elif spec.name in recipe.W8_WEIGHTS_BY_NAME:
-                    payload = _encode_w8_weight(spec, quantized_reader, resolved_device)
+                elif spec.name in recipe.GROUPED_WEIGHTS_BY_NAME:
+                    payload = _encode_grouped_weight(spec, quantized_reader, resolved_device)
                 elif spec.name in recipe.DIRECT_BY_NAME:
                     tensor = _materialize_direct(spec, quantized_reader)
                     payload = family_conversion.encode_tensor_payload(
@@ -564,7 +590,7 @@ def convert(
         "model": str(quantized_dir),
         "out": str(out_path),
         "device": requested_device,
-        "mtp_source": str(auxiliary_dir),
+        "mtp_source": str(auxiliary_dir) if auxiliary_dir else None,
     }
     report = _build_report(
         preflight=preflight,
@@ -593,11 +619,27 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
+        "--source",
+        default=source_profile.ACTIVE.name,
+        help=(
+            "source profile; the profile is selected by NINFER_NVFP4_SOURCE "
+            "before this module is imported, so this argument only reports "
+            "the active one"
+        ),
+    )
+    parser.add_argument(
         "--mtp-source",
         default=AUXILIARY_MTP_REPOSITORY,
         help="auxiliary checkpoint providing the four MTP tensors QAD omits",
     )
     arguments = parser.parse_args(argv)
+    if arguments.source != source_profile.ACTIVE.name:
+        raise SystemExit(
+            f"--source {arguments.source!r} does not match the active profile "
+            f"{source_profile.ACTIVE.name!r}; set "
+            f"NINFER_NVFP4_SOURCE={arguments.source} before importing the "
+            "converter"
+        )
     convert(
         arguments.model,
         arguments.out,

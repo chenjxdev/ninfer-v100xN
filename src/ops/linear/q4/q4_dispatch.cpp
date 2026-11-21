@@ -18,7 +18,12 @@ Q4Launch select_q4_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t
                                              n == 17408 ||  // 34816 / 2 (mlp/gate_up)
                                              n == 65536))|| // 131072/ 2 (draft_head)
                               (k == 2048 && n == 65536);    // 131072/ 2 (draft_head, short K)
-    if (!column_shard) { return nullptr; }
+    // Row-parallel shards: the MTP output projection and the MTP down projection contract
+    // over the 6144- and the 17408-wide input axis, so each rank owns half of K and the
+    // shard extent is [5120, 3072] / [5120, 8704].
+    const bool row_shard = n == 5120 && (k == 3072 ||  // 6144  / 2 (mtp/attention/output)
+                                         k == 8704);   // 17408 / 2 (mtp/mlp/down)
+    if (!column_shard && !row_shard) { return nullptr; }
     if (t == 1) {
         // The eight-row SM70 schedule is tuned for the V100 TP2 MLP shard. Keep the
         // inherited one-row/eight-warp route on other targets until they have their own
@@ -26,6 +31,11 @@ Q4Launch select_q4_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t
 #ifdef NINFER_VOLTA_BUILD
         if (n == 17408) { return launch_q4_gemv_r8_w1_direct; }
 #endif
+        // The one-row/eight-warp route is compiled for 80 groups per row, i.e. K = 5120:
+        // it takes its code-row stride from that constant rather than from the weight's
+        // own group count. The row-parallel shards (K = 3072 / 8704) therefore use the
+        // generic SIMT route, whose final stage is predicated.
+        if (k != 5120) { return launch_q4_simt_r8_c4; }
         return n >= 65536 ? launch_q4_gemv_r4_w1_direct : launch_q4_gemv_r1_w8_direct;
     }
     if (t <= 4) { return launch_q4_simt_r8_c4; }
@@ -81,6 +91,24 @@ Q4Launch select_q4_a16_registered(std::int32_t n, std::int32_t k, std::int32_t t
             return launch_q4_mma_r64_c128;
         default:
             break;
+        }
+        break;
+    case 6144:
+        // The MTP output projection contracts over the 6144-wide attention-context input;
+        // the tp1 extent is the full [5120, 6144] matrix.
+        if (n == 5120) {
+            if (t <= 4) { return launch_q4_simt_r8_c4; }
+            if (t <= 16) { return launch_q4_simt_r8_c8; }
+            return launch_q4_mma_r64_c128;
+        }
+        break;
+    case 17408:
+        // The MTP down projection contracts over the 17408-wide MLP intermediate; the tp1
+        // extent is the full [5120, 17408] matrix.
+        if (n == 5120) {
+            if (t <= 4) { return launch_q4_simt_r8_c4; }
+            if (t <= 16) { return launch_q4_simt_r8_c8; }
+            return launch_q4_mma_r64_c128;
         }
         break;
     case 2048:

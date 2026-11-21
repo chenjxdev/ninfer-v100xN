@@ -5,15 +5,27 @@ the checkpoint's ModelOpt FP8 attention quads to row-scaled FP8 storage
 (``FP8_E4M3FN_ROW_BF16S`` / ``row-scale-v1``) as a byte passthrough instead of
 requantizing them to NVFP4; every NVFP4 quad stays a byte passthrough with its
 paired FP32 input scale divisor. The artifact therefore lands in the engine's
-mixed ``Qwen38Nvfp4`` profile (per-object format binding), keeping the W8G32
-vocabulary endpoints of the full profile. FP8 projections are: every
-full-attention layer's qkv gate + o_proj (32 objects) and the ten GDN layers
-in ``FP8_GDN_LAYERS`` (20 objects) -- 52 objects over 94 ModelOpt FP8 source
-quads.
+mixed ``Qwen38Nvfp4`` profile (per-object format binding). The two vocabulary
+endpoints are stored INDEPENDENTLY and their precision follows the source
+profile (source_profile.SourceProfile): ``text/token_embedding`` and
+``text/output_head`` each declare a container format. The four MTP matrices
+are group-quantized to Q4G64 instead of W8G32;
+the MTP stem ``mtp/input_projection`` stays W8G32, because it is the one MTP
+matrix that mixes the normalized token embedding into the draft space and its
+4-bit codes would cost draft acceptance rate for the 27 MB the product can
+spare. FP8 projections are: every full-attention layer's qkv gate + o_proj
+(32 objects) and the ten GDN layers in ``FP8_GDN_LAYERS`` (20 objects) --
+52 objects over 94 ModelOpt FP8 source quads.
+
+The endpoint choice is a VRAM decision as much as a quality one: the input
+embedding is a per-device replica while the output head is split across the
+tensor-parallel devices, so widening the embedding costs a full copy per
+device and narrowing the head saves only half of its width.
 """
 
 from __future__ import annotations
 
+from . import source_profile
 from tools.convert.qwen3_6.common.inventory import (
     BF16,
     CONTIGUOUS_LAYOUT,
@@ -78,7 +90,11 @@ def tensor_spec(
 
 def _build_text_core_specs() -> tuple[TensorSpec, ...]:
     specs: list[TensorSpec] = [
-        tensor_spec("text/token_embedding", (248320, 5120), W8),
+        tensor_spec(
+            "text/token_embedding",
+            (248320, 5120),
+            source_profile.ACTIVE.embedding_format,
+        ),
     ]
     for layer in range(64):
         prefix = f"text/layers/{layer}/"
@@ -175,7 +191,11 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
     specs.extend(
         (
             tensor_spec("text/final_norm", (5120,), BF16),
-            tensor_spec("text/output_head", (248320, 5120), W8),
+            tensor_spec(
+                "text/output_head",
+                (248320, 5120),
+                source_profile.ACTIVE.output_head_format,
+            ),
         )
     )
     return tuple(specs)
@@ -195,14 +215,14 @@ def _build_mtp_specs() -> tuple[TensorSpec, ...]:
         tensor_spec("mtp/hidden_norm", (5120,), BF16),
         tensor_spec("mtp/layer/input_norm", (5120,), BF16),
         tensor_spec(
-            "mtp/layer/attention/query_key_gate_value", (14336, 5120), W8
+            "mtp/layer/attention/query_key_gate_value", (14336, 5120), Q4
         ),
         tensor_spec("mtp/layer/attention/query_norm", (256,), BF16),
         tensor_spec("mtp/layer/attention/key_norm", (256,), BF16),
-        tensor_spec("mtp/layer/attention/output", (5120, 6144), W8),
+        tensor_spec("mtp/layer/attention/output", (5120, 6144), Q4),
         tensor_spec("mtp/layer/post_attention_norm", (5120,), BF16),
-        tensor_spec("mtp/layer/mlp/gate_up", (34816, 5120), W8),
-        tensor_spec("mtp/layer/mlp/down", (5120, 17408), W8),
+        tensor_spec("mtp/layer/mlp/gate_up", (34816, 5120), Q4),
+        tensor_spec("mtp/layer/mlp/down", (5120, 17408), Q4),
         tensor_spec("mtp/final_norm", (5120,), BF16),
     )
 
@@ -412,6 +432,15 @@ def validate_inventory() -> None:
     names = tuple(spec.name for spec in OBJECT_SPECS)
     if len(names) != len(set(names)):
         raise ValueError("Qwen3.8 mixed-NVFP4 inventory contains duplicate names")
+    # The endpoint formats follow the source profile, so the numeric
+    # allocation follows them too: Q6 covers the vision patch embedding plus
+    # every endpoint stored as Q6, W8 covers the vision merger, the MTP stem
+    # plus every endpoint stored as W8.
+    endpoints = (
+        source_profile.ACTIVE.embedding_format,
+        source_profile.ACTIVE.output_head_format,
+    )
+    w8_count = 3 + sum(1 for item in endpoints if item == W8)
     if (
         len(TEXT_CORE_TENSOR_SPECS),
         len(DRAFT_HEAD_TENSOR_SPECS),
@@ -423,20 +452,23 @@ def validate_inventory() -> None:
         len(FP8_TENSOR_SPECS),
         len(W8_TENSOR_SPECS),
         len(INPUT_SCALE_DIVISOR_SPECS),
-    ) != (863, 2, 12, 333, 1210, 1216, 204, 52, 9, 204):
+    ) != (863, 2, 12, 333, 1210, 1216, 204, 52, w8_count, 204):
         raise ValueError("registered Qwen3.8 mixed-NVFP4 inventory is incomplete")
-    if FORMAT_COUNTS != {
+    expected_formats = {
         BF16: 534,
         FP32: 300,
         I32: 1,
-        Q4: 55,
+        Q4: 59,
         Q5: 54,
-        Q6: 1,
-        W8: 9,
+        Q6: 1 + sum(1 for item in endpoints if item == Q6),
+        W8: w8_count,
         NVFP4: 204,
         FP8: 52,
-    }:
-        raise ValueError(f"unexpected numeric allocation: {FORMAT_COUNTS}")
+    }
+    if FORMAT_COUNTS != expected_formats:
+        raise ValueError(
+            f"unexpected numeric allocation: {FORMAT_COUNTS} != {expected_formats}"
+        )
     if LAYOUT_COUNTS != {
         CONTIGUOUS_LAYOUT: 835,
         ROW_SPLIT_LAYOUT: 119,

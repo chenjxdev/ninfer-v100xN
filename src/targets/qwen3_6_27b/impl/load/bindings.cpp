@@ -1035,22 +1035,45 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         out.mtp_format = NumericFormat::FP8_E4M3FN_BLOCK128_BF16S;
         out.mtp_stem_format = NumericFormat::BF16;
     }
+    // The compressed-MTP layout stores the four MTP matrices as Q4G64 row-split
+    // instead of W8G32. It is a distinct storage profile inside the mixed
+    // Qwen38Nvfp4 weights profile, so the format is PROBED from the artifact
+    // rather than assumed: the W8 layout of the same profile must keep binding
+    // unchanged. The MTP stem stays W8G32 in both layouts.
+    if (weights_profile == WeightsProfile::Qwen38Nvfp4) {
+        const auto stores_q4_mtp = [&](std::string_view name, std::uint64_t rows,
+                                      std::uint64_t columns) {
+            const std::uint64_t shape[] = {rows, columns};
+            return binder.has_tensor(name, NumericFormat::Q4G64_F16S,
+                                     std::span<const std::uint64_t>(shape, 2));
+        };
+        if (stores_q4_mtp("mtp/layer/attention/query_key_gate_value", 14336, 5120) &&
+            stores_q4_mtp("mtp/layer/attention/output", 5120, 6144) &&
+            stores_q4_mtp("mtp/layer/mlp/gate_up", 34816, 5120) &&
+            stores_q4_mtp("mtp/layer/mlp/down", 5120, 17408)) {
+            out.mtp_format = NumericFormat::Q4G64_F16S;
+        }
+    }
 
-    NumericFormat vocabulary_format = endpoint_format(weights_profile);
-    // Mixed Qwen38Nvfp4 artifacts converted from NVFP4-source checkpoints keep the W8G32
-    // vocabulary endpoints of the full-NVFP4 profile (the v3 reader admits either endpoint
-    // pair); the official mixed layout stores row-scaled FP8 instead. Accept whichever pair
-    // the artifact actually stores.
+    // Mixed QAD artifacts select the embedding and output-head precision independently.
+    NumericFormat embedding_format = endpoint_format(weights_profile);
+    NumericFormat output_head_format = embedding_format;
     if (weights_profile == WeightsProfile::Qwen38Nvfp4) {
         static constexpr std::uint64_t kVocabShape[] = {248320, 5120};
         const std::span<const std::uint64_t> vocab_shape(kVocabShape, 2);
-        if (binder.has_tensor("text/token_embedding", NumericFormat::W8G32_F16S, vocab_shape) &&
-            binder.has_tensor("text/output_head", NumericFormat::W8G32_F16S, vocab_shape)) {
-            vocabulary_format = NumericFormat::W8G32_F16S;
+        if (binder.has_tensor("text/token_embedding", NumericFormat::W8G32_F16S, vocab_shape)) {
+            embedding_format = NumericFormat::W8G32_F16S;
+        } else if (binder.has_tensor("text/token_embedding", NumericFormat::Q6G64_F16S, vocab_shape)) {
+            embedding_format = NumericFormat::Q6G64_F16S;
+        }
+        if (binder.has_tensor("text/output_head", NumericFormat::W8G32_F16S, vocab_shape)) {
+            output_head_format = NumericFormat::W8G32_F16S;
+        } else if (binder.has_tensor("text/output_head", NumericFormat::Q6G64_F16S, vocab_shape)) {
+            output_head_format = NumericFormat::Q6G64_F16S;
         }
     }
     out.token_embedding =
-        bind_weight(binder, "text/token_embedding", vocabulary_format, {248320, 5120});
+        bind_weight(binder, "text/token_embedding", embedding_format, {248320, 5120});
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
@@ -1076,7 +1099,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     }
     out.final_norm =
         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {5120});
-    out.output_head = bind_weight(binder, "text/output_head", vocabulary_format, {248320, 5120});
+    out.output_head = bind_weight(binder, "text/output_head", output_head_format, {248320, 5120});
     const artifact::TensorPlacement proposal_placement =
         features.optimized_proposal() ? artifact::TensorPlacement::Device
                                       : artifact::TensorPlacement::ValidateOnly;
@@ -1349,9 +1372,15 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
             backing, plan.mtp.query_key_gate_value, plan.mtp_format, 14336 / tp, 5120,
             device);
 #ifdef NINFER_VOLTA_BUILD
+        // The W8 QPN prepack rewrites the weight payload in place, so it may only run on a
+        // W8G32 matrix: the compressed-MTP layout stores these matrices as Q4G64.
         if (plan.features.volta_fast_decode) {
-            ::ninfer::ops::detail::w8_prepack_qpn_sm70(mtp.input_projection);
-            ::ninfer::ops::detail::w8_prepack_qpn_sm70(mtp.attention.packed);
+            if (mtp.input_projection.qtype == QType::W8G32_F16S) {
+                ::ninfer::ops::detail::w8_prepack_qpn_sm70(mtp.input_projection);
+            }
+            if (mtp.attention.packed.qtype == QType::W8G32_F16S) {
+                ::ninfer::ops::detail::w8_prepack_qpn_sm70(mtp.attention.packed);
+            }
         }
 #endif
         const std::int32_t mtp_query_section = 6144 / tp;
@@ -1374,9 +1403,15 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
         mtp.post_mixer = load_mlp(plan.mtp.mlp, backing, tp, device, plan.features.volta_fast_decode);
 #ifdef NINFER_VOLTA_BUILD
         if (plan.features.volta_fast_decode) {
-            ::ninfer::ops::detail::w8_prepack_qpn_sm70(mtp.output);
-            ::ninfer::ops::detail::w8_prepack_qpn_sm70(mtp.post_mixer.gate_up);
-            ::ninfer::ops::detail::w8_prepack_qpn_sm70(mtp.post_mixer.down);
+            if (mtp.output.qtype == QType::W8G32_F16S) {
+                ::ninfer::ops::detail::w8_prepack_qpn_sm70(mtp.output);
+            }
+            if (mtp.post_mixer.gate_up.qtype == QType::W8G32_F16S) {
+                ::ninfer::ops::detail::w8_prepack_qpn_sm70(mtp.post_mixer.gate_up);
+            }
+            if (mtp.post_mixer.down.qtype == QType::W8G32_F16S) {
+                ::ninfer::ops::detail::w8_prepack_qpn_sm70(mtp.post_mixer.down);
+            }
         }
 #endif
         mtp.final_norm = artifact::materialized_tensor(backing, plan.mtp.final_norm,
