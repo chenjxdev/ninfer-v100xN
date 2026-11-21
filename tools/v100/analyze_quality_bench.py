@@ -3,62 +3,61 @@ from math import comb
 
 
 def sign_test(wins, losses):
-    """Two-sided exact sign test on the discordant pairs."""
     n = wins + losses
     if n == 0:
-        return 1.0
+        return 1.0, 0
     k = min(wins, losses)
     p = 2.0 * sum(comb(n, i) for i in range(k + 1)) / 2 ** n
-    return min(1.0, p)
+    return min(1.0, p), n
 
 
-q = json.load(open("/tmp/bench/qad-constraint.json"))
-d = json.load(open("/tmp/bench/daisy-constraint.json"))
-print("=== 精确约束类专项（%d 题）===" % q["total"])
-print("  QAD       %d/%d (%.0f%%)" % (q["passed"], q["total"], 100.0 * q["passed"] / q["total"]))
-print("  DaisyRose %d/%d (%.0f%%)" % (d["passed"], d["total"], 100.0 * d["passed"] / d["total"]))
-wins = sum(1 for a, b in zip(q["results"], d["results"]) if a["ok"] and not b["ok"])
-loss = sum(1 for a, b in zip(q["results"], d["results"]) if b["ok"] and not a["ok"])
-both_fail = sum(1 for a, b in zip(q["results"], d["results"]) if not a["ok"] and not b["ok"])
-print("  不一致：QAD 独赢 %d，DaisyRose 独赢 %d；两模型都错 %d" % (wins, loss, both_fail))
-print("  双侧符号检验 p = %.4f" % sign_test(wins, loss))
+def load(name):
+    try:
+        return json.load(open("/tmp/bench/%s.json" % name))
+    except FileNotFoundError:
+        return None
 
-print()
-print("=== 词数约束专项（按要求的词数 N 分档）===")
-import re
-buckets = {}
-for a, b in zip(q["results"], d["results"]):
-    m = re.search(r"(?:恰好|exactly)\s*(\d+)\s*(?:English\s*)?words?", a["prompt"], re.I)
-    if not m:
-        continue
-    n = int(m.group(1))
-    e = buckets.setdefault(n, [0, 0, 0])
-    e[0] += 1
-    e[1] += int(a["ok"])
-    e[2] += int(b["ok"])
-for n in sorted(buckets):
-    total, qok, dok = buckets[n]
-    print("  N=%-3d QAD %d/%d   DaisyRose %d/%d" % (n, qok, total, dok, total))
 
-print()
-print("=== 全部题（45 题主集 + 30 题约束专项）===")
-try:
-    qn = json.load(open("/tmp/bench/qad-nothink.json"))
-    dn = json.load(open("/tmp/bench/daisy-nothink.json"))
-    print("  主集全题   QAD %d/%d   DaisyRose %d/%d" % (
-        qn["passed"], qn["total"], dn["passed"], dn["total"]))
-    w2 = sum(1 for a, b in zip(qn["results"], dn["results"]) if a["ok"] and not b["ok"])
-    l2 = sum(1 for a, b in zip(qn["results"], dn["results"]) if b["ok"] and not a["ok"])
-    print("  主集不一致：QAD 独赢 %d，DaisyRose 独赢 %d  p = %.4f" % (w2, l2, sign_test(w2, l2)))
-except FileNotFoundError:
-    pass
-try:
-    qt = json.load(open("/tmp/bench/qad-think.json"))
-    dt = json.load(open("/tmp/bench/daisy-think.json"))
-    print("  难题(开思考) QAD %d/%d   DaisyRose %d/%d" % (
-        qt["passed"], qt["total"], dt["passed"], dt["total"]))
-    w3 = sum(1 for a, b in zip(qt["results"], dt["results"]) if a["ok"] and not b["ok"])
-    l3 = sum(1 for a, b in zip(qt["results"], dt["results"]) if b["ok"] and not a["ok"])
-    print("  难题不一致：QAD 独赢 %d，DaisyRose 独赢 %d  p = %.4f" % (w3, l3, sign_test(w3, l3)))
-except FileNotFoundError:
-    pass
+def report(label, q, d, show_diff=True):
+    if not q or not d:
+        print("(%s 缺数据)" % label)
+        return
+    print("=== %s ===" % label)
+    cq, cd = {}, {}
+    for r in q["results"]:
+        e = cq.setdefault(r["category"], [0, 0]); e[0] += 1; e[1] += int(r["ok"])
+    for r in d["results"]:
+        e = cd.setdefault(r["category"], [0, 0]); e[0] += 1; e[1] += int(r["ok"])
+    for cat in sorted(set(cq) | set(cd)):
+        a, b = cq.get(cat, [0, 0]), cd.get(cat, [0, 0])
+        mark = "" if a[1] == b[1] else ("   DaisyRose +%d" % (b[1] - a[1]) if b[1] > a[1]
+                                        else "   QAD +%d" % (a[1] - b[1]))
+        print("  %-14s QAD %2d/%-3d  DaisyRose %2d/%-3d%s" % (cat, a[1], a[0], b[1], b[0], mark))
+    w = sum(1 for a, b in zip(q["results"], d["results"]) if a["ok"] and not b["ok"])
+    l = sum(1 for a, b in zip(q["results"], d["results"]) if b["ok"] and not a["ok"])
+    both = sum(1 for a, b in zip(q["results"], d["results"]) if not a["ok"] and not b["ok"])
+    p, n = sign_test(w, l)
+    print("  %-14s QAD %2d/%-3d  DaisyRose %2d/%-3d" % ("TOTAL", q["passed"], q["total"], d["passed"], d["total"]))
+    print("  不一致：QAD 独赢 %d，DaisyRose 独赢 %d，两模型都错 %d；双侧符号检验 p = %.4f" % (w, l, both, p))
+    print()
+
+
+report("全题（关思考）", load("qad-nothink"), load("daisy-nothink"))
+report("难题（开思考）", load("qad-think"), load("daisy-think"))
+report("精确约束专项", load("qad-constraint"), load("daisy-constraint"))
+
+q, d = load("qad-nothink"), load("daisy-nothink")
+if q and d:
+    print("=== 逐题差异（关思考）===")
+    for a, b in zip(q["results"], d["results"]):
+        if a["ok"] != b["ok"]:
+            print("  [%s] %s" % (a["category"], a["prompt"][:58].replace("\n", " ")))
+            print("     QAD   %-4s %s" % ("PASS" if a["ok"] else "FAIL", a["answer"][:88].replace("\n", " ")))
+            print("     Daisy %-4s %s" % ("PASS" if b["ok"] else "FAIL", b["answer"][:88].replace("\n", " ")))
+    print()
+    print("=== 两模型都错的题（区分度为 0 的部分）===")
+    cats = {}
+    for a, b in zip(q["results"], d["results"]):
+        if not a["ok"] and not b["ok"]:
+            cats[a["category"]] = cats.get(a["category"], 0) + 1
+    print("  ", cats)

@@ -78,18 +78,21 @@ def code_blocks(text):
 
 
 def run_python(source, tests):
-    """Execute the model's code and check its output. Returns (ok, detail)."""
+    """Execute the model's code and check its output. Returns (ok, detail).
+
+    Each test entry is ``(expected, *args)``.
+    """
     namespace = {}
     try:
         exec(compile(source, "<model>", "exec"), namespace)
     except Exception as error:
         return False, "syntax/runtime error: %s" % error
-    for name, args, expected in tests:
+    for name, expected, args in tests:
         fn = namespace.get(name)
         if fn is None:
             return False, "missing function %s" % name
         try:
-            got = fn(args)
+            got = fn(*args)
         except Exception as error:
             return False, "%s raised %s" % (name, error)
         if got != expected:
@@ -149,12 +152,12 @@ ITEMS = [
 
     # --- 代码（可执行验证）---
     ("code", "Write a Python function `f(s)` that returns the length of the longest run of identical consecutive characters in s. Output only one Python code block.",
-     lambda t: _code_ok(t, "f", [("aaabbc", 3), ("xyz", 1), ("aabb", 2)])),
+     lambda t: _code_ok(t, "f", [(3, "aaabbc"), (1, "xyz"), (2, "aabb")])),
     ("code", "Write a Python function `is_palindrome(s)` that returns True if s is a palindrome ignoring case and non-alphanumeric characters. Output only one Python code block.",
      lambda t: _code_ok(t, "is_palindrome", [
-         ("A man, a plan, a canal: Panama", True), ("hello", False), ("", True)])),
+         (True, "A man, a plan, a canal: Panama"), (False, "hello"), (True, "")])),
     ("code", "Write a Python function `second_largest(nums)` that returns the second largest distinct value in a list with at least two distinct elements. Output only one Python code block.",
-     lambda t: _code_ok(t, "second_largest", [([3, 1, 4, 1, 5, 9, 2, 6], 6), ([2, 2, 3], 2)])),
+     lambda t: _code_ok(t, "second_largest", [(6, [3, 1, 4, 1, 5, 9, 2, 6]), (2, [2, 2, 3])])),
 
     # --- 格式与边界 ---
     ("boundary", "请给出明天（北京时间）上海的确切天气和温度。",
@@ -306,6 +309,106 @@ ITEMS = [
      lambda t: has_number(t, 3)),
     ("constraint", "用英文回答，恰好 9 words: describe what an API is. Output only the words.",
      lambda t: len([w for w in re.split(r"\s+", t.strip()) if w]) == 9),
+
+    # --- 第五批：可执行代码题（14 道，规格更细，带边界用例）---
+    ("code", "Write a Python function `is_anagram(a, b)` that returns True when a and b are "
+     "anagrams of each other, ignoring case and spaces. Output only one Python code block.",
+     lambda t: _code_ok(t, "is_anagram", [(True, "Listen", "Silent"), (False, "hello", "world"),
+                                          (True, "a b", "ba")])),
+    ("code", "Write a Python function `fizzbuzz(n)` that returns a list of n strings: "
+     "'Fizz' for multiples of 3, 'Buzz' for multiples of 5, 'FizzBuzz' for both, "
+     "otherwise the number as a string. Output only one Python code block.",
+     lambda t: _code_ok(t, "fizzbuzz", [(["1", "2", "Fizz", "4", "Buzz"], 5),
+                                         (["1", "2", "Fizz"], 3)])),
+    ("code", "Write a Python function `binary_gap(n)` that returns the number of zeros "
+     "between consecutive 1s in the binary representation of a positive integer, or 0 if "
+     "there is only one 1. Output only one Python code block.",
+     lambda t: _code_ok(t, "binary_gap", [(2, 9), (4, 529), (1, 20)])),
+    ("code", "Write a Python function `reverse_words(s)` that returns the words of s in "
+     "reverse order, separated by single spaces. Output only one Python code block.",
+     lambda t: _code_ok(t, "reverse_words", [("foo world hello", "hello world foo"),
+                                             ("b a", "a b")])),
+    ("code", "Write a Python function `is_balanced(s)` that returns True when the brackets "
+     "(), [] and {} in s are correctly nested. Output only one Python code block.",
+     lambda t: _code_ok(t, "is_balanced", [(True, "([]{})"), (False, "([)]"), (False, "(")])),
+    ("code", "Write a Python function `dedup(nums)` that removes duplicates from a list "
+     "while preserving the original order. Output only one Python code block.",
+     lambda t: _code_ok(t, "dedup", [([1, 2, 3], [1, 2, 1, 3, 2]), ([], [])])),
+    ("code", "Write a Python function `digit_sum(n)` that returns the sum of the decimal "
+     "digits of n, ignoring a leading minus sign. Output only one Python code block.",
+     lambda t: _code_ok(t, "digit_sum", [(6, 123), (9, -45), (0, 0)])),
+    ("code", "Write a Python function `chunk_list(lst, n)` that splits a list into "
+     "consecutive chunks of n elements; the last chunk may be shorter. Output only one "
+     "Python code block.",
+     lambda t: _code_ok(t, "chunk_list", [([[1, 2], [3, 4], [5]], [1, 2, 3, 4, 5], 2),
+                                          ([], [], 3)])),
+    ("code", "Write a Python function `title_case(s)` that returns s with the first letter "
+     "of every word capitalized. Output only one Python code block.",
+     lambda t: _code_ok(t, "title_case", [("Hello World", "hello world"), ("A", "a")])),
+    ("code", "Write a Python function `merge_sorted(a, b)` that merges two already sorted "
+     "lists into one sorted list. Output only one Python code block.",
+     lambda t: _code_ok(t, "merge_sorted", [([1, 2, 3, 4], [1, 3], [2, 4]),
+                                             ([1], [], [1])])),
+    ("code", "Write a Python function `count_vowels(s)` that counts the vowels a, e, i, o, u "
+     "in s, ignoring case. Output only one Python code block.",
+     lambda t: _code_ok(t, "count_vowels", [(2, "Hello"), (0, "xyz")])),
+    ("code", "Write a Python function `rotate_list(lst, k)` that rotates the list to the "
+     "right by k positions. Output only one Python code block.",
+     lambda t: _code_ok(t, "rotate_list", [([4, 5, 1, 2, 3], [1, 2, 3, 4, 5], 2),
+                                           ([1, 2, 3], [1, 2, 3], 0)])),
+    ("code", "Write a Python function `second_smallest(nums)` that returns the second "
+     "smallest distinct value of a list. Output only one Python code block.",
+     lambda t: _code_ok(t, "second_smallest", [(2, [4, 1, 3, 1, 2]), (7, [9, 9, 4, 7]),
+                                                (2, [1, 2, 1])])),
+    ("code", "Write a Python function `remove_outliers(nums)` that removes the single "
+     "highest and single lowest value from a list and returns the rest. Output only one "
+     "Python code block.",
+     lambda t: _code_ok(t, "remove_outliers", [([2, 3, 4], [1, 2, 3, 4, 5]),
+                                               ([20], [10, 20, 30])])),
+
+    # --- 第六批：高区分度题（20 道，全部客观可判）---
+    ("trace", "下面这行 Python 会打印什么？只输出打印出的列表：print([i*2 for i in range(5) if i%2==0])",
+     lambda t: re.sub(r"\s", "", t) in ("[0,4,8]", "[0, 4, 8]")),
+    ("trace", "下面这段 Python 会打印什么？只输出数字：\nx = 10\ndef f():\n    global x\n    x = 20\nf()\nprint(x)",
+     lambda t: has_number(t, 20) and not has_number(t, 10)),
+    ("trace", "在 Python 中 0.1 + 0.2 == 0.3 的结果是什么？只输出 True 或 False。",
+     lambda t: t.strip().rstrip("。.") in ("False", "false", "FALSE")),
+    ("trace", "在 Python 中执行 a = [1,2,3]; b = a; b.append(4) 之后，len(a) 是多少？只回答数字。",
+     lambda t: has_number(t, 4)),
+    ("trace", "在 Python 中执行 x = [0] * 3; x[0] += 1 之后，x 等于什么？只输出这个列表。",
+     lambda t: re.sub(r"\s", "", t) in ("[1,0,0]", "[1,0,0]")),
+    ("trace", "在 Python 中 len('ab' * 3) 的值是多少？只回答数字。",
+     lambda t: has_number(t, 6)),
+    ("trace", "在 Python 中 d = {'a':1}，表达式 d.get('b', 0) + 2 的值是多少？只回答数字。",
+     lambda t: has_number(t, 2)),
+    ("math", "如果时钟显示 2 点 45 分，时针和分针之间的较小夹角是多少度？只回答数字。",
+     lambda t: has_number(t, 172.5, 0.5)),
+    ("math", "从 1 数到 1000（含），数字 1 一共出现了多少次？只回答数字。",
+     lambda t: has_number(t, 301)),
+    ("math", "从 1 数到 100（含），十位上是 7 的数有多少个？只回答数字。",
+     lambda t: has_number(t, 10)),
+    ("math", "2024 年是闰年吗？是输出 1，不是输出 0。只回答数字。",
+     lambda t: has_number(t, 1) and not has_number(t, 0)),
+    ("math", "1 除以 3 的结果保留两位小数是多少？只回答数字。",
+     lambda t: has_number(t, 0.33, 0.005)),
+    ("math", "一个正方形的周长是 20 厘米，它的面积是多少平方厘米？只回答数字。",
+     lambda t: has_number(t, 25)),
+    ("math", "英文单词 'mississippi' 里字母 s 一共出现了几次？只回答数字。",
+     lambda t: has_number(t, 4)),
+    ("math", "中文'今天天气不错'一共有几个汉字？只回答数字。",
+     lambda t: has_number(t, 6)),
+    ("constraint", "写一句中文，必须同时包含'光'、'年'、'秒'三个字，且不超过 20 个汉字。只输出这句话。",
+     lambda t: has_all(t, "光", "年", "秒")
+     and len(re.findall(r"[一-鿿]", t)) <= 20),
+    ("constraint", "列出恰好 5 个以字母 C 开头的英文单词，用逗号分隔，不要其它内容。",
+     lambda t: _c_words_ok(t)),
+    ("constraint", "把这 4 个数字按降序排列，用英文逗号分隔，只输出结果：17, 4, 23, 8",
+     lambda t: re.sub(r"\s", "", t).strip(",.。") == "23,17,8,4"),
+    ("constraint", "用英文回答，恰好 7 个词，且必须包含 'model' 一词：解释什么是神经网络。只输出这 7 个词。",
+     lambda t: len([w for w in re.split(r"\s+", t.strip()) if w]) == 7
+     and "model" in t.lower()),
+    ("cn-fact", "把'臺灣'写成简体字，只输出这两个字。",
+     lambda t: t.strip() == "台湾"),
 ]
 
 
@@ -323,10 +426,12 @@ def _json_ok(text):
 
 
 def _code_ok(text, name, tests):
+    """Each test entry is ``(expected, *args)``."""
     blocks = code_blocks(text)
     if not blocks:
         return False
-    ok, _detail = run_python(blocks[0], [(name, args, expected) for args, expected in tests])
+    ok, _detail = run_python(
+        blocks[0], [(name, entry[0], tuple(entry[1:])) for entry in tests])
     return ok
 
 
@@ -376,6 +481,16 @@ def _json_array_ok2(text, expected):
     except Exception:
         return False
     return data == expected and "```" not in text
+
+
+def _c_words_ok(text):
+    """Exactly five comma separated English words, each starting with c."""
+    body = text.strip().strip("。.")
+    words = [w.strip().strip(".,;:'\"") for w in body.split(",")]
+    words = [w for w in words if w]
+    if len(words) != 5:
+        return False
+    return all(w.lower().startswith("c") and w.isascii() and w.isalpha() for w in words)
 
 
 # ------------------------------------------------------------------- main
