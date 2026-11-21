@@ -20,13 +20,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from tools.artifact.container import TensorSpec
 from tools.convert.qwen3_6.common.inventory import (
     BF16,
     CONTIGUOUS_LAYOUT,
     FP32,
     ROW_SPLIT_LAYOUT,
+    ResourceSpec,
+    TensorSpec,
 )
+
+# The frontend resources, and the checkpoint file each one comes from.
+RESOURCE_SOURCES = {
+    "frontend/tokenizer.json": "tokenizer.json",
+    "frontend/tokenizer_config.json": "tokenizer_config.json",
+    "frontend/chat_template.jinja": "chat_template.jinja",
+    "frontend/generation_config.json": "generation_config.json",
+    "frontend/preprocessor_config.json": "processor_config.json",
+}
+RESOURCE_SPECS = tuple(ResourceSpec(name) for name in RESOURCE_SOURCES)
 
 # The artifact's format vocabulary (tools/artifact/numeric.py); the names are
 # repeated here because the shared inventory module only covers the groupwise
@@ -58,7 +69,7 @@ LOOP_GATE_RANK = 64
 ATTN_RES_LAYERS = 23
 # The attention-residual query is three vectors on the full-attention layers
 # and one elsewhere (the shapes come straight from the checkpoint).
-ATTN_RES_QUERY_WIDTH = {4: 3, 5: 3, 10: 3, 16: 3, 22: 3}
+ATTN_RES_QUERY_WIDTH = {4: 3, 10: 3, 16: 3, 22: 3}
 
 # Layers whose experts are MXFP8 (F8_E4M3 codes with UE8M0 block scales).
 MXFP8_LAYERS = (20, 21, 22, 23)
@@ -102,10 +113,13 @@ def _nvfp4_spec(name: str, shape) -> TensorSpec:
 
 def text_specs() -> list[TensorSpec]:
     specs = [
-        _spec("text/embed", (VOCAB, HIDDEN), BF16, ROW_SPLIT_LAYOUT),
+        # The vocabulary endpoints stay BF16: the artifact's row-split layout
+        # only accepts the grouped formats, and a BF16 vocabulary is kept as a
+        # per-device replica (the Qwen3.6-27B target does the same).
+        _spec("text/embed", (VOCAB, HIDDEN), BF16),
         _spec("text/embed_norm", (HIDDEN,), BF16),
         _spec("text/final_norm", (HIDDEN,), BF16),
-        _spec("text/output_head", (VOCAB, HIDDEN), BF16, ROW_SPLIT_LAYOUT),
+        _spec("text/output_head", (VOCAB, HIDDEN), BF16),
     ]
     for index in range(ATTN_RES_LAYERS):
         width = ATTN_RES_QUERY_WIDTH.get(index, 1)
@@ -126,12 +140,13 @@ def text_specs() -> list[TensorSpec]:
         specs.append(_spec(prefix + "/attn/gate", (HEADS * HEAD_DIM, HIDDEN), BF16))
         specs.append(_spec(prefix + "/attn/sink", (HEADS, HIDDEN), BF16))
         specs.append(_spec(prefix + "/attn/q_clip", (HEADS, HEAD_DIM), BF16))
-        specs.append(_spec(prefix + "/attn/rel_clip", (N_REL, HEADS), BF16))
+        specs.append(_spec(prefix + "/attn/rel_clip", (HEADS, N_REL), BF16))
         specs.append(_spec(prefix + "/attn/rel_proj", (N_REL, HEADS_KV * HEAD_DIM), BF16))
-        specs.append(_spec(prefix + "/attn/k_sconv", (HEADS_KV * HEAD_DIM, CONV_TAPS), BF16))
-        specs.append(_spec(prefix + "/attn/v_sconv", (HEADS_KV * HEAD_DIM, CONV_TAPS), BF16))
         specs.append(_spec(prefix + "/attn/sconv", (HIDDEN, CONV_TAPS), BF16))
         if plan.full_attention:
+            # Full-attention layers replace the plain K/V convolutions with
+            # input-dependent taps, and use separate input norms instead of a
+            # single attention norm.
             specs.append(_spec(prefix + "/attn/q_input_norm", (HIDDEN,), BF16))
             specs.append(_spec(prefix + "/attn/k_input_norm", (HIDDEN,), BF16))
             specs.append(_spec(prefix + "/attn/v_input_norm", (HIDDEN,), BF16))
@@ -140,6 +155,8 @@ def text_specs() -> list[TensorSpec]:
             specs.append(_spec(prefix + "/attn/v_sconv_static", (CONV_TAPS, HEADS_KV * HEAD_DIM), BF16))
             specs.append(_spec(prefix + "/attn/v_sconv_proj", (CONV_TAPS * HEADS_KV, HIDDEN), BF16))
         else:
+            specs.append(_spec(prefix + "/attn/k_sconv", (HEADS_KV * HEAD_DIM, CONV_TAPS), BF16))
+            specs.append(_spec(prefix + "/attn/v_sconv", (HEADS_KV * HEAD_DIM, CONV_TAPS), BF16))
             specs.append(_spec(prefix + "/attn/norm", (HIDDEN,), BF16))
         specs.append(_spec(prefix + "/mlp/norm", (HIDDEN,), BF16))
         specs.append(_spec(prefix + "/mlp/sconv", (HIDDEN, CONV_TAPS), BF16))
@@ -189,8 +206,8 @@ def vision_specs() -> list[TensorSpec]:
     return specs
 
 
-def object_specs() -> list[TensorSpec]:
-    return text_specs() + vision_specs()
+def object_specs() -> list:
+    return list(RESOURCE_SPECS) + text_specs() + vision_specs()
 
 
 def validate_inventory() -> None:
