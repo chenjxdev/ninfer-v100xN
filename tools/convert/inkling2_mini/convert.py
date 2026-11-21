@@ -19,9 +19,14 @@ from pathlib import Path
 
 import torch
 
-from tools.artifact.container import ArtifactIdentity, ArtifactWriter
+from tools.artifact.container import (
+    ArtifactIdentity,
+    ArtifactWriter,
+    ResourceSpec as ArtifactResourceSpec,
+)
 from tools.artifact.layouts import encode_nvfp4
 from tools.convert.common.safetensors import ShardReader
+from tools.convert.qwen3_6.common import conversion as family_conversion
 
 from . import inventory as inv
 
@@ -29,19 +34,19 @@ SOURCE_PREFIX = "model.llm"
 VISION_PREFIX = "model.visual"
 LOOP_SITES = ("attn", "k", "v", "mlp")
 DENSE_ATTN = {
-    "q": "attn.wq_du.weight",
-    "k": "attn.wk_dv.weight",
-    "v": "attn.wv_dv.weight",
-    "o": "attn.wo_ud.weight",
-    "rel": "attn.wr_du.weight",
-    "gate": "attn.gate_attn.weight",
-    "sink": "attn.attn_sink_proj.weight",
-    "q_clip": "attn.q_l2_clip.scale",
-    "rel_clip": "attn.rel_l2_clip.scale",
-    "rel_proj": "attn.rel_logits_proj.proj",
-    "k_sconv": "attn.k_sconv.weight",
-    "v_sconv": "attn.v_sconv.weight",
-    "sconv": "attn_sconv.weight",
+    "attn/q": "attn.wq_du.weight",
+    "attn/k": "attn.wk_dv.weight",
+    "attn/v": "attn.wv_dv.weight",
+    "attn/o": "attn.wo_ud.weight",
+    "attn/rel": "attn.wr_du.weight",
+    "attn/gate": "attn.gate_attn.weight",
+    "attn/sink": "attn.attn_sink_proj.weight",
+    "attn/q_clip": "attn.q_l2_clip.scale",
+    "attn/rel_clip": "attn.rel_l2_clip.scale",
+    "attn/rel_proj": "attn.rel_logits_proj.proj",
+    "attn/k_sconv": "attn.k_sconv.weight",
+    "attn/v_sconv": "attn.v_sconv.weight",
+    "attn/sconv": "attn_sconv.weight",
 }
 
 
@@ -165,13 +170,13 @@ def build_payload(object_name: str, spec, reader: ShardReader, plan, expert_cach
             consumed.add(prefix + "." + suffix)
         if plan.mxfp8_experts:
             weights = expert_cache.setdefault(
-                (plan.index, "w13"), reader.get(prefix + ".w13_weight"))
+                (plan.index, which), reader.get(prefix + ".%s_weight" % which))
             scales = expert_cache.setdefault(
-                (plan.index, "w13s"), reader.get(prefix + ".w13_weight_scale"))
+                (plan.index, which + "s"), reader.get(prefix + ".%s_weight_scale" % which))
             dequantized = dequantize_mxfp8(weights[expert], scales[expert])
             tensor = dequantized.reshape(inv.HIDDEN, 2 * inv.EXPERT_HIDDEN) if which == "w13" \
                 else dequantized.reshape(inv.HIDDEN, inv.EXPERT_HIDDEN)
-            return tensor.contiguous().view(torch.bfloat16).numpy().tobytes()
+            return tensor.contiguous().view(torch.uint16).numpy().tobytes()
         packed = expert_cache.setdefault(
             (plan.index, which), reader.get(prefix + ".%s_weight" % which))[expert]
         scales = expert_cache.setdefault(
@@ -198,18 +203,25 @@ def build_payload(object_name: str, spec, reader: ShardReader, plan, expert_cach
     consumed.add(name)
     tensor = reader.get(name)
     if tensor.dtype == torch.bfloat16:
-        return tensor.contiguous().view(torch.bfloat16).numpy().tobytes()
+        return tensor.contiguous().view(torch.uint16).numpy().tobytes()
     if tensor.dtype == torch.float32:
-        return tensor.contiguous().view(torch.float32).numpy().tobytes()
+        return tensor.contiguous().view(torch.int32).numpy().tobytes()
     raise ValueError(f"{name}: unsupported dtype {tensor.dtype}")
 
 
 def convert(model_dir: str | Path, out_path: str | Path) -> Path:
     started = time.perf_counter()
     output = Path(out_path)
-    specs = inv.object_specs()
     inv.validate_inventory()
     plans = {plan.index: plan for plan in inv.layer_plans()}
+
+    source_dir = Path(model_dir)
+    resources = {
+        name: (source_dir / source_file).read_bytes()
+        for name, source_file in inv.RESOURCE_SOURCES.items()
+    }
+    specs = family_conversion.build_object_plan(
+        inv.object_specs(), resources).specs
 
     reader = ShardReader(str(model_dir))
     consumed: set[str] = set()
@@ -221,11 +233,16 @@ def convert(model_dir: str | Path, out_path: str | Path) -> Path:
         ) as writer:
             expert_cache = {}
             for index, spec in enumerate(specs, start=1):
+                if isinstance(spec, ArtifactResourceSpec):
+                    writer.write(spec.name, resources[spec.name])
+                    if index % 256 == 0 or index == len(specs):
+                        print(f"[{index}/{len(specs)}] written", flush=True)
+                    continue
                 layer_index = None
                 if spec.name.startswith("text/layers/"):
                     layer_index = int(spec.name.split("/")[2])
                 plan = plans.get(layer_index)
-                payload, used = build_payload(
+                payload = build_payload(
                     spec.name, spec, reader, plan, expert_cache, consumed)
                 writer.write(spec.name, payload)
                 if index % 256 == 0 or index == len(specs):
