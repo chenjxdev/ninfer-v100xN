@@ -115,14 +115,10 @@ measurements of this target. The supported identities are
 `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.8-27b/groupwise-int`,
 `qwen3.8-27b/nvfp4`, `qwen3.8-27b/fp8`, `qwen3.8-27b/gguf-q4-k-m`, and
 `qwen3.6-35b-a3b/groupwise-int`.
-Qwen3.8-27B v3 containers labelled `qwen3.8-27b` or `qwen3.8-27b-<variant>` (for example the
-Coder390 fine-tune converted with the official NVFP4 recipe) are admitted only through these
-identities' complete structural inventory checks; the label never selects a storage profile.
-The explicitly requested QUASAR trial adds `qwen3.8-27b/nvfp4-full`, currently restricted to
-SM70 TP2 Text/None/MTP/DFlash, TP2 image/video Vision with None/MTP, experimental TP4
+The explicitly requested QUASAR trial adds `qwen3.8-27b/quasar-nvfp4`, currently restricted to
+SM70 TP1 Text/None/MTP, TP2 Text/None/MTP/DFlash, TP2 image/video Vision with None/MTP, experimental TP4
 Text/None/MTP, and experimental PP2 Text/None/MTP. Vision excludes DFlash, PP2 and the fast-decode numerical profile. Vision admits the default-off
-long-attention profile on TP2 with complete INT8 group-64 KV. It registers every qwen3.8-27b v3 container whose complete
-Text inventory is full NVFP4 with W8 vocabulary endpoints (QUASAR and derived fine-tunes), classified structurally, preserves its
+long-attention profile on TP2 with complete INT8 group-64 KV. It registers the published QUASAR v3 container identity, preserves its
 256 NVFP4 parents and FP32 activation divisors, and keeps its W8 vocabulary/MTP and BF16 GDN
 controls and optional W8/BF16 DFlash2 package. The 27B draft window remains at most seven.
 This artifact's QAT/conversion quality is not established by inference smoke tests.
@@ -176,7 +172,7 @@ The 27B draft window is at most seven. On this V100X2, the verified DFlash profi
 capacity with a 1024-token prefill chunk, not the 180000-capacity MTP acceptance profile.
 
 The optional `volta_long_attention` profile admits SM70 27B TP2/TP4, PP1 experimental 1–8-request
-Text/None/MTP and TP2 Vision/None/MTP with complete INT8 group-64 KV, without RAM-KV. It retains every
+Text/None/MTP and TP2 Text/DFlash or Vision/None/MTP with complete INT8 group-64 KV, without RAM-KV. It retains every
 causally visible key but changes split partitioning, softmax association and PV accumulation;
 it is default-off and not bit-equivalent to ordinary attention. The 104-question local GPQA
 comparison is behavioral evidence, not a full 198-question evaluation or proof of losslessness.
@@ -196,8 +192,10 @@ qualification for this release uses the QUASAR v3 TP2/MTP4 artifact; no new GPQA
 Release 0.1.2 contains these Vision changes and an optional qualified Linux SM70 prebuilt;
 QUASAR TP4 qualification is recorded separately and ships in release 0.2.0.
 
-The optional `volta_fast_decode` profile is default-off and admits QUASAR SM70 TP2/TP4
-Text/None/MTP. It selects packed NVFP4 parents with FP32 scale-after-K-reduction and
+The optional `volta_fast_decode` profile is default-off and admits QUASAR SM70 TP1/TP2/TP4
+Text/None/MTP and TP2 Text/DFlash. DFlash keeps its native W8/BF16 drafter; its target verifier
+separately admits the optional seven/eight-query complete-history long-attention profile.
+Fast decode selects packed NVFP4 parents with FP32 scale-after-K-reduction and
 shape-specific packed MTP W8 reductions. The normal profile retains per-group FP16 scaling
 with the same exact weight layout, fusion and communication optimizations. Both paths keep
 original codes/scales/divisors and one resident copy. The fast profile can change logits and
@@ -208,6 +206,14 @@ removed the fixed speed goal and requested six decode trials, retaining MTP4: at
 overlap, MTP tail fusion, TP2 communication/norm, NVFP4 QPN scheduling, GDN value tiles,
 and verified history lookup. Neither 200 nor 250 tok/s is a completion condition or measured limit.
 No current-combination GPQA result is available.
+The 2026-11-15 TP2 DFlash7 follow-up ports both default-off numerical experiments.
+At the saved 85K raw-prefix fixture, ordinary/long/fast/both measure
+122.647/167.494/128.106/168.149 committed wall tok/s, two repetitions each.
+These are changed-output profiles, not exact-output kernel gains or quality scores.
+Long-only and combined actual-85K Graph/eager ID/logit/counter gates pass;
+short state/teacher-forced and independent FP64 Op checks pass. The HumanEval
+32-task throughput subset measures 301.212->302.380 with both; 2/64 outputs change.
+No new GPQA or pass@1 is established. See docs/performance.md for workload limits.
 The earlier remote TP4 campaign retains MTP4 and that host's 220 W / 1200 MHz limits. After the
 216.934 tok/s result, the user requested a measured same-host 1Cat comparison and reopened
 optimization toward a 300 committed tok/s stretch target at 85000 occupied input tokens.
@@ -282,11 +288,6 @@ The v0.2.1 TP2 concurrency update adds packed NVFP4 batch projections at T9..64 
 CUTLASS path and changes measured C8 output/acceptance. Independent FP64 operator and
 real QUASAR C2/C4/C8 Graph/eager state checks qualify the route; no new GPQA is claimed.
 See docs/performance.md for the local 2K/16K/85K workload and throughput.
-At sampled temperatures the TP2 optimized proposal head draws each MTP draft from its own
-truncated top-20 distribution and stores it; verification accepts with `min(1, p/q)` and
-resamples `max(0, p - q)`, preserving the target distribution. Other proposal routes keep
-one-hot drafts. TP2 27B prefill uses the same Split-D D256 kernel as TP4, which passes the
-85K head-local FP64 prefill oracle and changes floating-point association.
 
 One Engine owns one resident model, with one device, TP2, experimental PP2, or the selected TP4 domain on the 27B
 package and a startup-fixed

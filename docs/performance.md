@@ -1,31 +1,32 @@
 # QUASAR NVFP4 performance
 
+## v0.2.2 single V100 16 GB
+
+QUASAR NVFP4 v3, TP1/MTP4, one cold greedy request with the same 85,000 code-token IDs,
+513 output tokens, INT8 group-64 KV, prefix reuse disabled. Prefill uses input count divided
+by prefill time. Decode uses the 512 tokens after the first divided by their wall time.
+
+| Single-card profile | Cold prefill (s) | Prefill (tok/s) | Decode (tok/s) |
+|---|---:|---:|---:|
+| Earlier development build | 226.98 | 374.48 | 87.41 |
+| Optimized, CUDA Graph run 1 | 90.38 | 940.47 | 113.94 |
+| Optimized, CUDA Graph run 2 | 90.67 | 937.51 | 113.90 |
+| Optimized, eager | 90.63 | 937.83 | 114.00 |
+| v0.2.2 clean release build, CUDA Graph | 89.34 | 951.46 | 113.82 |
+
+The 9,472-token GPU window and 1,280-token prefill chunks use host-backed KV retrieval.
+All four optimized runs emitted identical IDs and accepted 373 of 551 proposals in 138 rounds.
+The earlier profile used an 8,320-token GPU window and 128-token chunks. Its output first
+differed at token 18. Quality and long-context recall under these settings are unmeasured.
+[Single-card command](prebuilt.md#single-v100-16-gb)
+
+TP2 DFlash additionally supports the optional long-attention and fast-decode profiles. On its
+85K raw-prefix fixture DFlash7 measured 122.65 tok/s by default and 168.15 tok/s with both enabled.
+Both options can affect output.
+
 Local hardware: 2 × Tesla V100-SXM2 16 GB, SXM2-to-PCIe adapters, PCIe 3.0 ×16 P2P without NVLink, CUDA 12.8 / SM70. Decode rates count committed tokens, excluding rejected drafts. Context capacity and occupied input length are reported separately. Loading and CUDA Graph priming are outside request timing.
 
 [llama.cpp / LM Studio controls](llama-comparison.md) · [Other V100 profiles](performance-v100.md) · [TP4/NVLink](tp4.md) · [RAM-KV/PP2](experiments.md) · [Inherited upstream campaigns](performance-upstream.md)
-
-## TP2 PCIe sampled MTP and Split-D prefill (2026-11-09)
-
-Host: 2 × V100-SXM2 16 GB on PCIe 3.0 P2P without NVLink, 175 W limit, CUDA 12.8 / SM70.
-Artifact: a full-NVFP4 Qwen3.8-27B v3 derivative (Swift15) with the optimized proposal head,
-262144 capacity, INT8 group-64 KV, MTP4, long-attention and fast-decode profiles. Requests use
-thinking mode with temperature 1.0, top-p 0.95, top-k 20 and a fixed seed; GPUs cool to at most
-60 °C HBM before each case. Clocks are not locked; HBM throttling leaves about ±5% run-to-run
-decode noise.
-
-Sampled drafts with stored proposal distributions (exact `min(1,p/q)` acceptance):
-
-| Case | Before: accept / decode tok/s | After: accept / decode tok/s |
-|---|---:|---:|
-| 68-token prompt, 4096 output, seed 11 | 28.9% / 89.4 | 44.9% / 116.2 |
-| 68-token prompt, 4096 output, seed 22 | 36.7% / 99.2 | 42.1% / 106.7 |
-| 61774 cached tokens, 1536 output, seed 22 | 30.3% / 78.6 | 40.5% / 92.9 |
-
-Routing the TP2 12q/2kv geometry through the Split-D D256 prefill kernel raises uncached
-61799-token prefill from 1003.2 / 996.5 to 1027.9 / 1029.0 tok/s. The TP2 head-local prefill
-oracle now includes the 2560-query, 85000-key fragmented chunk, which the replaced masked
-Q-block route failed at the registered FP64 criterion and Split-D passes. Split-D changes
-floating-point association, so later sampled trajectories can differ.
 
 ## TP4 concurrent packed-batch decode (2026-11-05)
 
@@ -1276,7 +1277,7 @@ Further QUASAR candidates and their external sources are in the
 ## QUASAR v3: final long-context decode evaluation
 
 Measured on 2026-10-13 on two V100-SXM2-16GB cards, CUDA 12.8 / SM70, qualified
-PCIe P2P without NVLink. The artifact is `qwen3.8-27b/nvfp4-full`; the code input
+PCIe P2P without NVLink. The artifact is `qwen3.8-27b/quasar-nvfp4`; the code input
 is the saved `profiles/bench/v100-code-85000-iommu-pt.ids`. Both routes use 85000
 actual input tokens, 180000 capacity (180032 allocated), complete INT8 group-64 KV,
 chunk 2560, greedy optimized-head MTP4 and CUDA Graphs. Each has two measured cold
@@ -1418,7 +1419,7 @@ operator and full-vocabulary comparisons above retain their completed evidence.
 
 ## QUASAR v3: Volta QPN projections
 
-The separate `qwen3.8-27b/nvfp4-full` trial uses the published QUASAR NInfer v3 artifact
+The separate `qwen3.8-27b/quasar-nvfp4` trial uses the published QUASAR NInfer v3 artifact
 on this two-card PCIe-P2P host, without NVLink. QUASAR is QAT, not mathematically lossless
 compression. Its stored NVFP4 codes/scales and FP32 activation divisors remain unchanged;
 this does not establish BF16-equivalent artifact quality. The profile is text-only and loads

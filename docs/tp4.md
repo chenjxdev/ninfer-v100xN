@@ -210,7 +210,7 @@ Four Tesla V100-SXM2 16 GB cards, all-pairwise NV2, CUDA 12.8 / SM70. The existi
 **220 W per-card power limit and 1200 MHz SM ceiling were retained; no power or clock
 setting was changed**. The existing `gpu-guard.service` drop-in sets `PL=220` and
 `MAXCLK=1200`; its launcher applies that graphics-clock ceiling.
-The published QUASAR NVFP4 v3 artifact is registered as `qwen3.8-27b/nvfp4-full`.
+The published QUASAR NVFP4 v3 artifact is registered as `qwen3.8-27b/quasar-nvfp4`.
 Deployment files are under `~/Ninfer` on the four-card host.
 
 The public `ninfer_bench` Engine route uses 180000 context capacity (180032 allocated),
@@ -332,9 +332,8 @@ Source mechanisms and numerical boundaries:
   floating-point association in the normal and experimental profiles; saved outputs first
   differ from the preceding 231 stage at output **505**. Passing the attention oracle does
   not prove unchanged logits or task accuracy. Provenance and license notices are retained.
-  The subsequent N32→N64 prefill tile uses 57856 bytes of opt-in shared memory. The same
-  kernel now also serves the TP2 twelve-query-head geometry (see `docs/performance.md`).
-  Its real final chunk (2560 queries ending at
+  The subsequent N32→N64 prefill tile uses 57856 bytes of opt-in shared memory and applies
+  only to the TP4 six-query-head geometry. Its real final chunk (2560 queries ending at
   85000 occupied keys, fragmented pages) passes the unchanged independent FP64 criterion
   on 18 sampled columns across all 24 heads, evaluating every visible key and dimension.
   Exact full-width guards and cache checks also pass. The existing TP1 GPU comparator

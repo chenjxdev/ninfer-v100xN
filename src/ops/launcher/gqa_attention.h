@@ -29,7 +29,15 @@ struct GqaSmallTInvocation {
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                           DType cache_dtype, GqaExecutionEnvelope envelope);
 
-bool gqa_attention_uses_small_t(std::int32_t tokens);
+inline bool gqa_attention_uses_wide_long_verify(std::int32_t q_heads, std::int32_t tokens,
+                                               DType cache_dtype, GqaExecutionEnvelope envelope) {
+#ifdef NINFER_VOLTA_BUILD
+    return q_heads == 12 && (tokens == 7 || tokens == 8) && cache_dtype == DType::I8 &&
+           envelope.volta_long_attention && envelope.max_visible_keys > 16390;
+#else
+    return false;
+#endif
+}
 
 // Private short-context TP4 batch profile: keep the softmax numerator in FP32
 // through the split merge. The public BF16 output and original INT8 KV stay fixed.
@@ -85,12 +93,6 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
 // 12K prompt mask would be 288 MB and grows quadratically, one Q-block's is
 // ~25 MB at that length. Phase 4 sweeps this.
 inline constexpr std::int32_t kVoltaFlashQBlockTokens = 640;
-
-// The 27B tensor-parallel halves (12q/2kv) and quarters (6q/1kv) run the whole width through
-// the Split-D D256 kernel instead of masked Q-blocks.
-inline constexpr bool volta_splitd_prefill_heads(std::int32_t q_heads) {
-    return q_heads == 12 || q_heads == 6;
-}
 
 // Below this width the chunked route's smaller fixed cost wins, and the staging
 // buffers are not worth allocating.

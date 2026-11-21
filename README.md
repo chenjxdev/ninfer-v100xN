@@ -31,6 +31,14 @@ The authors report GPQA-D 90.91% versus BF16 91.41%, and AIME'26 100% for both.
 These are external source-checkpoint results, not our V100 conversion scores or proof of
 losslessness. [Sources, independent comparison and limitations](docs/model-quality.md).
 
+## v0.2.2 · QUASAR on one 16 GB V100
+
+One V100-SXM2 16 GB now runs QUASAR NVFP4 text with MTP4. On the same 85,000-token code input,
+cold prefill rose from **374.5 to 939.0 tok/s** and committed decode from **87.4 to 113.9 tok/s**.
+The baseline was an earlier single-card development build. The 9,472-token GPU window retrieves
+older KV from host RAM. Retrieval and experimental arithmetic can change output. Quality has
+not been evaluated for this profile. [Single-card launch command](docs/prebuilt.md#single-v100-16-gb)
+
 ## v0.2.1: TP2 / TP4 concurrency and serving fixes
 
 QUASAR NVFP4 / MTP4 now uses packed batch projections, direct packet publication and fused
@@ -281,7 +289,9 @@ env LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD
 ```
 
 For DFlash7 use capacity 98304, chunk 1024 and `--spec dflash --draft-tokens 7`, omitting
-`--lm-head-draft`. Output is bounded by remaining context.
+`--lm-head-draft`. TP2 DFlash also admits the default-off `--volta-long-attention`
+and `--volta-fast-decode` experiments; both can change output and acceptance.
+[DFlash measurements and limits](docs/performance.md). Output is bounded by remaining context.
 For CLI use `build-v100/apps/ninfer` with the same inference flags and `--prompt TEXT --max-new N`.
 Installed GPU count does not fix runtime width: `--tp 2 --devices 4,6` selects a pair on an
 eight-card host. With `CUDA_VISIBLE_DEVICES=4,6`, use logical devices `0,1`.

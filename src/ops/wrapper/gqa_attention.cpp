@@ -331,17 +331,16 @@ VoltaFlashWorkspace allocate_volta_flash_workspace(Allocator& workspace, std::in
     const std::int32_t n_kv =
         ((visible + detail::kVoltaFlashKeyPad - 1) / detail::kVoltaFlashKeyPad) *
         detail::kVoltaFlashKeyPad;
-    const bool splitd           = detail::volta_splitd_prefill_heads(q_heads);
-    const std::int32_t tokens = splitd ? width :
+    const std::int32_t tokens = q_heads == 6 ? width :
         std::min(width, detail::kVoltaFlashQBlockTokens);
 
     return {
         workspace.alloc(DType::FP16, {kHeadDim, kv_heads, n_kv, 1}),
         workspace.alloc(DType::FP16, {kHeadDim, kv_heads, n_kv, 1}),
-        splitd ? Tensor{} :
+        q_heads == 6 ? Tensor{} :
             workspace.alloc(DType::FP16, {n_kv, tokens + detail::kVoltaFlashMaskRowPad, 1, 1}),
-        workspace.alloc(splitd ? DType::FP16 : DType::FP32,
-                        {kHeadDim, q_heads, splitd ? (tokens + 63) / 64 * 64 : tokens, 1}),
+        workspace.alloc(q_heads == 6 ? DType::FP16 : DType::FP32,
+                        {kHeadDim, q_heads, q_heads == 6 ? (tokens + 63) / 64 * 64 : tokens, 1}),
         workspace.alloc(DType::FP32, {kHeadDim, q_heads, tokens, 1}),
         workspace.alloc(DType::FP32,
                         {2, static_cast<std::int32_t>(
@@ -409,6 +408,9 @@ GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t
                                               std::int32_t batch_size, DType cache_dtype,
                                               GqaExecutionEnvelope envelope) {
     if (width >= 1 && width <= kSmallTChunkTokens) { return GqaAttentionRoute::SmallT; }
+    if (gqa_attention_uses_wide_long_verify(q_heads, width, cache_dtype, envelope)) {
+        return GqaAttentionRoute::SmallT;
+    }
     if (batch_size > 1) { return GqaAttentionRoute::ChunkedSmallT; }
 #ifdef NINFER_VOLTA_BUILD
     // Volta tiled flash attention, for single-batch prefill wide enough to pay for
@@ -712,7 +714,7 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
         launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out, stream);
         return;
     }
-    if (detail::gqa_attention_uses_small_t(q.ne[2])) {
+    if (route == detail::GqaAttentionRoute::SmallT) {
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], q.ne[2], cache.dtype, envelope);
         SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits);

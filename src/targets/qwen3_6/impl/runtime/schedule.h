@@ -5,7 +5,6 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "ninfer/ops/sampling.h"
-#include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/bidirectional_gqa_attention.h"
 #include "ninfer/ops/kv_cache_append_prefix.h"
 #include "ninfer/ops/swa.h"
@@ -240,7 +239,6 @@ struct TargetVerifyFrameView {
     Tensor selected_hidden;
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;
-    ops::DraftDistributionView proposals{};
     DFlashFeatureSink* feature_sink        = nullptr;
 };
 

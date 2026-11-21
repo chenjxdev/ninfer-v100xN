@@ -56,14 +56,59 @@ void verify(const char* path) {
 
     Reader reader(path);
     require(reader.identity().model_id == "qwen3.8-27b" &&
-                reader.identity().weights_id == "nvfp4-full", "QUASAR identity was not retained");
+                reader.identity().weights_id == "quasar-nvfp4", "QUASAR identity was not retained");
     require(reader.objects().size() == 1334, "QUASAR projected inventory is incomplete");
+    {
+        Binder binder(reader, 1);
+        const auto plan = bind_artifact(binder, WeightsProfile::Qwen38QuasarNvfp4,
+            {.speculative = ninfer::SpeculativeBackend::Mtp}, 1);
+        int mapped_embeddings = 0;
+        for (const auto& placement : plan.materialization.host_objects) {
+            if (placement.device_readable) {
+                require(object_name(binder.descriptor(placement.object)) == "text/token_embedding",
+                        "unexpected single-GPU mapped weight");
+                ++mapped_embeddings;
+            }
+        }
+        require(mapped_embeddings == 1, "single-GPU token embedding must reside in host RAM");
+        for (const auto& placement : plan.materialization.device_objects) {
+            require(object_name(binder.descriptor(placement.object)) != "text/token_embedding",
+                    "single-GPU token embedding has a duplicate device copy");
+        }
+    }
+    {
+        Binder binder(reader, 1);
+        const auto plan = bind_artifact(binder, WeightsProfile::Qwen38QuasarNvfp4,
+            {.volta_fast_decode = true, .speculative = ninfer::SpeculativeBackend::Mtp,
+             .proposal_head = ninfer::ProposalHead::Optimized}, 1);
+        bool head = false;
+        bool ids = false;
+        for (const auto& placement : plan.materialization.device_objects) {
+            const auto name = object_name(binder.descriptor(placement.object));
+            if (name == "text/draft_head" || name == "text/draft_head_token_ids") {
+                const auto& tensor = std::get<TensorDescriptor>(binder.descriptor(placement.object));
+                const auto expected = tensor_row_slice(tensor.layout, tensor.format, tensor.shape,
+                                                        std::array{SliceRange{0, 65536}});
+                require(placement.bytes == expected.encoded_bytes &&
+                        placement.copies.size() == expected.copies.size(),
+                        "single-GPU proposal prefix byte count");
+                for (std::size_t j = 0; j < expected.copies.size(); ++j) {
+                    require(placement.copies[j].source_offset == expected.copies[j].source_offset &&
+                            placement.copies[j].dest_offset == expected.copies[j].dest_offset &&
+                            placement.copies[j].bytes == expected.copies[j].bytes,
+                            "single-GPU proposal prefix plane mismatch");
+                }
+                if (name == "text/draft_head") { head = true; } else { ids = true; }
+            }
+        }
+        require(head && ids, "single-GPU compressed proposal requires both weights and IDs");
+    }
     for (const int tp : {2, 4}) {
         for (const auto backend : {ninfer::SpeculativeBackend::None, ninfer::SpeculativeBackend::Mtp,
                                    ninfer::SpeculativeBackend::DFlash}) {
             if (tp == 4 && backend == ninfer::SpeculativeBackend::DFlash) { continue; }
             Binder binder(reader, tp);
-            const auto plan = bind_artifact(binder, WeightsProfile::Qwen38FullNvfp4,
+            const auto plan = bind_artifact(binder, WeightsProfile::Qwen38QuasarNvfp4,
                 {.speculative = backend,
                  .proposal_head = backend == ninfer::SpeculativeBackend::Mtp
                      ? ninfer::ProposalHead::Optimized : ninfer::ProposalHead::Full}, tp);
@@ -141,7 +186,7 @@ void verify(const char* path) {
         Binder binder(reader, 4);
         bool rejected = false;
         try {
-            (void)bind_artifact(binder, WeightsProfile::Qwen38FullNvfp4,
+            (void)bind_artifact(binder, WeightsProfile::Qwen38QuasarNvfp4,
                 {.vision = mode == 0, .volta_fast_decode = false,
                  .speculative = mode == 1 ? ninfer::SpeculativeBackend::DFlash
                                           : ninfer::SpeculativeBackend::Mtp}, 4);
@@ -150,7 +195,7 @@ void verify(const char* path) {
     }
     {
         Binder binder(reader, 4);
-        const auto plan = bind_artifact(binder, WeightsProfile::Qwen38FullNvfp4,
+        const auto plan = bind_artifact(binder, WeightsProfile::Qwen38QuasarNvfp4,
             {.volta_fast_decode = true, .speculative = ninfer::SpeculativeBackend::Mtp}, 4);
         require(plan.bindings.features.volta_fast_decode,
                 "TP4 experimental fast-decode profile was not selected");
@@ -158,7 +203,7 @@ void verify(const char* path) {
     for (const auto device : {ninfer::VisionDevice::Gpu, ninfer::VisionDevice::Cpu}) {
     for (const auto backend : {ninfer::SpeculativeBackend::None, ninfer::SpeculativeBackend::Mtp}) {
         Binder binder(reader, 2);
-        const auto plan = bind_artifact(binder, WeightsProfile::Qwen38FullNvfp4,
+        const auto plan = bind_artifact(binder, WeightsProfile::Qwen38QuasarNvfp4,
             {.vision = true, .vision_device = device, .speculative = backend}, 2);
         int vision_objects = 0;
         int host_vision_objects = 0;
@@ -179,15 +224,23 @@ void verify(const char* path) {
     }
     {
         Binder binder(reader, 2);
-        const auto plan = bind_artifact(binder, WeightsProfile::Qwen38FullNvfp4,
+        const auto plan = bind_artifact(binder, WeightsProfile::Qwen38QuasarNvfp4,
             {.volta_fast_decode = true, .speculative = ninfer::SpeculativeBackend::Mtp}, 2);
         require(plan.bindings.features.volta_fast_decode, "experimental profile was not selected");
+    }
+    {
+        Binder binder(reader, 2);
+        const auto plan = bind_artifact(binder, WeightsProfile::Qwen38QuasarNvfp4,
+            {.volta_fast_decode = true, .speculative = ninfer::SpeculativeBackend::DFlash}, 2);
+        require(plan.bindings.features.volta_fast_decode &&
+                    plan.bindings.dflash.projection_format == NumericFormat::W8G32_F16S,
+                "DFlash fast target profile changed the native W8 drafter");
     }
     for (int mode = 0; mode < 3; ++mode) {
         Binder binder(reader, 2);
         bool rejected = false;
         try {
-            (void)bind_artifact(binder, WeightsProfile::Qwen38FullNvfp4,
+            (void)bind_artifact(binder, WeightsProfile::Qwen38QuasarNvfp4,
                 {.vision = true, .volta_fast_decode = mode == 0,
                  .speculative = mode == 1 ? ninfer::SpeculativeBackend::DFlash
                                           : ninfer::SpeculativeBackend::Mtp},
