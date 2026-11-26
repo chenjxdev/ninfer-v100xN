@@ -397,7 +397,12 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                             state.execution.device.stream);
                 Tensor values = state.execution.work.alloc(DType::FP32, {1, selector_columns});
                 Tensor indices = state.execution.work.alloc(DType::I32, {1, selector_columns});
-                ops::argmax_with_value(logits, values, indices, TextConfig::output_rows,
+                // argmax_with_value takes the winners as [columns] (the column count in
+                // ne[0]); the shard buffers are [1, columns] for the merge below, which is
+                // the same contiguous layout.
+                Tensor value = values.view({selector_columns});
+                Tensor index = indices.view({selector_columns});
+                ops::argmax_with_value(logits, value, index, TextConfig::output_rows,
                                         state.execution.device.stream);
                 Tensor gathered_values = state.execution.work.alloc(DType::FP32, {1, selector_columns});
                 Tensor gathered_indices = state.execution.work.alloc(DType::I32, {1, selector_columns});
@@ -422,14 +427,18 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 std::array<Tensor, 2>{part0, part1}, *state.execution.peers[0].execution);
             Tensor values0 = state.execution.work.alloc(DType::FP32, {1, selector_columns});
             Tensor indices0 = state.execution.work.alloc(DType::I32, {1, selector_columns});
-            ops::argmax_with_value(part0, values0, indices0, shard_rows,
+            Tensor value0 = values0.view({selector_columns});
+            Tensor index0 = indices0.view({selector_columns});
+            ops::argmax_with_value(part0, value0, index0, shard_rows,
                                     state.execution.device.stream);
             Tensor values1 = state.execution.peers[0].work->alloc(DType::FP32, {1, selector_columns});
             Tensor indices1 = state.execution.peers[0].work->alloc(DType::I32, {1, selector_columns});
             {
                 const CurrentDevice restore;
                 CUDA_CHECK(cudaSetDevice(state.execution.peers[0].device->device));
-                ops::argmax_with_value(part1, values1, indices1, shard_rows,
+                Tensor value1 = values1.view({selector_columns});
+                Tensor index1 = indices1.view({selector_columns});
+                ops::argmax_with_value(part1, value1, index1, shard_rows,
                                         state.execution.peers[0].device->stream);
             }
             Tensor gathered_values = state.execution.work.alloc(DType::FP32, {2, selector_columns});
