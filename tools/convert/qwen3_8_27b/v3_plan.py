@@ -101,7 +101,11 @@ def build_plan(specs: Sequence[ObjectSpec]) -> V3Plan:
 
     def bind(logical: str, physical: str, rows: tuple[int, int] | None = None) -> None:
         shape = shapes[physical]
-        width = shape[-1] if shape else 1
+        # A row range is expressed in elements: a matrix row is ``shape[1]``
+        # wide, while a vector's "rows" are its own elements (one each), which
+        # is how the engine's add() tiles a fused bias such as the vision
+        # tower's packed query/key/value bias.
+        width = shape[1] if len(shape) >= 2 else 1
         total = _elements(shape)
         if rows is None:
             begin, end = 0, total
