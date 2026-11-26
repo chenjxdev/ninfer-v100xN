@@ -7,8 +7,10 @@ Qwen3 decoder blocks that read the target's hidden states at layers
 
 Unlike the DFlash2 package the target already understands, MMFlash has no
 dynamic grouped convolution and no candidate selector, and it draws its draft
-tokens from the target's own output head.  The draft therefore reuses the
-runtime's ``dflash/`` object names minus the convolution and selector objects.
+tokens from the target's own output head.  Everything else -- the packed
+query/key/value rows, the packed gate/up rows, the norms -- uses the same
+``dflash/`` object names and the same layout as DFlash2, so the runtime binds
+and executes it through the existing code path.
 
 The projections are stored as ``W8G32_F16S`` (group size 32, one binary16
 scale per group), exactly like the DFlash2 package in the official v3
@@ -40,6 +42,8 @@ MMFLASH_MASK_TOKEN_ID = 248070
 _HIDDEN = 5120
 _INTERMEDIATE = 17408
 _LAYERS = 5
+_QUERY = 32 * 128
+_KV = 8 * 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,8 +56,40 @@ class MMFlashObject:
     payload: bytes
 
 
-def _source_tensors() -> tuple[tuple[str, str, tuple[int, ...]], ...]:
-    """Map every MMFlash source tensor onto its runtime object name and shape."""
+def _packed_projection_specs() -> tuple[tuple[str, tuple[int, ...], tuple[str, ...]], ...]:
+    """Objects that are assembled from several checkpoint tensors.
+
+    The runtime binds one packed weight per projection, so the checkpoint's
+    separate query/key/value and gate/up matrices are concatenated here, in
+    the same row order DFlash2 uses.
+    """
+    specs: list[tuple[str, tuple[int, ...], tuple[str, ...]]] = []
+    for layer in range(_LAYERS):
+        prefix = f"layers.{layer}."
+        target = f"dflash/layers/{layer}/"
+        specs.append(
+            (
+                target + "attention/query_key_value",
+                (_QUERY + 2 * _KV, _HIDDEN),
+                (
+                    prefix + "self_attn.q_proj.weight",
+                    prefix + "self_attn.k_proj.weight",
+                    prefix + "self_attn.v_proj.weight",
+                ),
+            )
+        )
+        specs.append(
+            (
+                target + "mlp/gate_up",
+                (2 * _INTERMEDIATE, _HIDDEN),
+                (prefix + "mlp.gate_proj.weight", prefix + "mlp.up_proj.weight"),
+            )
+        )
+    return tuple(specs)
+
+
+def _single_tensors() -> tuple[tuple[str, str, tuple[int, ...]], ...]:
+    """Objects that map one-to-one onto a checkpoint tensor."""
     names: list[tuple[str, str, tuple[int, ...]]] = [
         ("dflash/feature_projection", "fc.weight", (_HIDDEN, 5 * _HIDDEN)),
         ("dflash/context_norm", "hidden_norm.weight", (_HIDDEN,)),
@@ -64,42 +100,17 @@ def _source_tensors() -> tuple[tuple[str, str, tuple[int, ...]], ...]:
         names.extend(
             [
                 (target + "input_norm", prefix + "input_layernorm.weight", (_HIDDEN,)),
-                (
-                    target + "attention/query",
-                    prefix + "self_attn.q_proj.weight",
-                    (32 * 128, _HIDDEN),
-                ),
-                (
-                    target + "attention/key",
-                    prefix + "self_attn.k_proj.weight",
-                    (8 * 128, _HIDDEN),
-                ),
-                (
-                    target + "attention/value",
-                    prefix + "self_attn.v_proj.weight",
-                    (8 * 128, _HIDDEN),
-                ),
                 (target + "attention/query_norm", prefix + "self_attn.q_norm.weight", (128,)),
                 (target + "attention/key_norm", prefix + "self_attn.k_norm.weight", (128,)),
                 (
                     target + "attention/output",
                     prefix + "self_attn.o_proj.weight",
-                    (_HIDDEN, 32 * 128),
+                    (_HIDDEN, _QUERY),
                 ),
                 (
                     target + "post_attention_norm",
                     prefix + "post_attention_layernorm.weight",
                     (_HIDDEN,),
-                ),
-                (
-                    target + "mlp/gate",
-                    prefix + "mlp.gate_proj.weight",
-                    (_INTERMEDIATE, _HIDDEN),
-                ),
-                (
-                    target + "mlp/up",
-                    prefix + "mlp.up_proj.weight",
-                    (_INTERMEDIATE, _HIDDEN),
                 ),
                 (
                     target + "mlp/down",
@@ -135,6 +146,12 @@ def validate_mmflash_config(config: dict) -> None:
         raise ValueError("unsupported MMFlash block size")
 
 
+def _encode_norm(tensor: torch.Tensor) -> bytes:
+    if tensor.dtype != torch.bfloat16:
+        raise ValueError(f"expected a BF16 norm, got {tensor.dtype}")
+    return encode_direct(tensor.to(torch.bfloat16).contiguous(), BF16)
+
+
 def build_mmflash_objects(
     model: str | Path,
     *,
@@ -146,20 +163,19 @@ def build_mmflash_objects(
     validate_mmflash_config(config)
 
     reader = ShardReader.from_file(root / "model.safetensors")
-    names = _source_tensors()
-    expected = {source for _, source, _ in names}
-    missing = sorted(expected - set(reader.names))
+    required = {source for _, source, _ in _single_tensors()}
+    for _, _, sources in _packed_projection_specs():
+        required.update(sources)
+    missing = sorted(required - set(reader.names))
     if missing:
         raise ValueError(f"MMFlash checkpoint is missing tensors: {missing[:4]}")
 
     objects: list[MMFlashObject] = []
     with reader:
-        for name, source, shape in names:
+        for name, source, shape in _single_tensors():
             tensor = reader.get(source)
             if tuple(tensor.shape) != shape:
-                raise ValueError(
-                    f"{source}: expected {shape}, got {tuple(tensor.shape)}"
-                )
+                raise ValueError(f"{source}: expected {shape}, got {tuple(tensor.shape)}")
             if name.endswith(
                 (
                     "/query_norm",
@@ -170,17 +186,25 @@ def build_mmflash_objects(
                     "/final_norm",
                 )
             ):
-                if tensor.dtype != torch.bfloat16:
-                    raise ValueError(f"{source}: expected BF16, got {tensor.dtype}")
-                payload = encode_direct(tensor.to(torch.bfloat16).contiguous(), BF16)
-                objects.append(MMFlashObject(name, shape, BF16, payload))
+                objects.append(
+                    MMFlashObject(name, shape, BF16, _encode_norm(tensor))
+                )
                 continue
-            # Every remaining object is a projection matrix.  The weight is stored
-            # as [N, K]; the artifact's W8 layout expects the same logical order.
-            weight = tensor.to(torch.float32)
-            if tuple(weight.shape) != shape:
-                raise ValueError(f"{source}: expected {shape}, got {tuple(weight.shape)}")
-            payload = quantize_and_encode(weight, W8G32_F16S, device=device)
+            payload = quantize_and_encode(
+                tensor.to(torch.float32), W8G32_F16S, device=device
+            )
+            objects.append(MMFlashObject(name, shape, W8G32_F16S, payload))
+
+        for name, shape, sources in _packed_projection_specs():
+            # The checkpoint stores query/key/value and gate/up separately; the
+            # runtime binds one packed weight per projection, so the rows are
+            # concatenated in the order DFlash2 uses.
+            fused = torch.cat([reader.get(source) for source in sources], dim=0)
+            if tuple(fused.shape) != shape:
+                raise ValueError(f"{name}: expected {shape}, got {tuple(fused.shape)}")
+            payload = quantize_and_encode(
+                fused.to(torch.float32), W8G32_F16S, device=device
+            )
             objects.append(MMFlashObject(name, shape, W8G32_F16S, payload))
     return objects
 
