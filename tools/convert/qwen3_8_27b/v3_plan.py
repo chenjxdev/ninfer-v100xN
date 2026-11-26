@@ -26,9 +26,46 @@ from tools.artifact.container_v3 import V3Binding, V3Plan, V3Use
 
 from . import inventory_nvfp4 as inventory
 
+from . import inventory_nvfp4 as inventory
+
 FULL_ATTENTION_LAYERS = inventory.FULL_ATTENTION_LAYERS
 VISION_LAYERS = 27
 MTP_LAYER = "mtp/layers/0/"
+MMFLASH_LAYERS = 5
+
+# The geometry of the first-generation DFlash draft, as its checkpoint states
+# it.  The engine validates the package against this before it binds it.
+MMFLASH_CONFIG = {
+    "architectures": ["DFlashDraftModel"],
+    "attention_bias": False,
+    "attention_dropout": 0.0,
+    "block_size": 16,
+    "dtype": "bfloat16",
+    "head_dim": 128,
+    "hidden_act": "silu",
+    "hidden_size": 5120,
+    "initializer_range": 0.02,
+    "intermediate_size": 17408,
+    "layer_types": ["full_attention"] * MMFLASH_LAYERS,
+    "max_position_embeddings": 262144,
+    "model_type": "qwen3",
+    "num_attention_heads": 32,
+    "num_hidden_layers": MMFLASH_LAYERS,
+    "num_key_value_heads": 8,
+    "num_target_layers": 64,
+    "rms_norm_eps": 1e-06,
+    "rope_parameters": {"rope_theta": 10000000.0, "rope_type": "default"},
+    "sliding_window": None,
+    "tie_word_embeddings": False,
+    "use_cache": True,
+    "use_sliding_window": False,
+    "vocab_size": 248320,
+    "dflash_config": {
+        "block_size": 16,
+        "mask_token_id": 248070,
+        "target_layer_ids": [1, 16, 31, 46, 61],
+    },
+}
 
 #: The frontend resources the engine reads through the text component.
 TEXT_RESOURCES = (
@@ -178,6 +215,29 @@ def build_plan(specs: Sequence[ObjectSpec]) -> V3Plan:
     for part in ("weight", "bias"):
         bind(f"vision/merger/norm_{part}", f"vision/merger/norm/{part}")
 
+    # The first-generation DFlash draft (MMFlash).  The engine reads the
+    # draft's target-layer taps and block width from the component's
+    # configuration, so the package states them alongside its parameters.
+    carries_mmflash = inventory.CARRIES_MMFLASH
+    if carries_mmflash:
+        for role in ("feature_projection", "context_norm", "final_norm"):
+            bind(f"dflash/{role}", f"dflash/{role}")
+        for layer in range(MMFLASH_LAYERS):
+            prefix = f"dflash/layers/{layer}/"
+            projection = prefix + "attention/query_key_value"
+            bind(prefix + "attention/query", projection, (0, 4096))
+            bind(prefix + "attention/key", projection, (4096, 5120))
+            bind(prefix + "attention/value", projection, (5120, 6144))
+            bind(prefix + "attention/query_norm", prefix + "attention/query_norm")
+            bind(prefix + "attention/key_norm", prefix + "attention/key_norm")
+            bind(prefix + "attention/output", prefix + "attention/output")
+            bind(prefix + "input_norm", prefix + "input_norm")
+            bind(prefix + "post_attention_norm", prefix + "post_attention_norm")
+            gate_up = prefix + "mlp/gate_up"
+            bind(prefix + "mlp/gate", gate_up, (0, 17408))
+            bind(prefix + "mlp/up", gate_up, (17408, 34816))
+            bind(prefix + "mlp/down", prefix + "mlp/down")
+
     components = {
         "text": {
             "resources": {
@@ -190,10 +250,19 @@ def build_plan(specs: Sequence[ObjectSpec]) -> V3Plan:
             }
         },
     }
-    return V3Plan(tuple(bindings), tuple(uses), components)
+    component_configs = (
+        {"mmflash": {"target": "text", "config": MMFLASH_CONFIG}}
+        if carries_mmflash
+        else {}
+    )
+    return V3Plan(
+        tuple(bindings), tuple(uses), components, component_configs
+    )
 
 
 __all__ = [
+    "MMFLASH_CONFIG",
+    "MMFLASH_LAYERS",
     "MTP_LAYER",
     "TEXT_RESOURCES",
     "VISION_LAYERS",

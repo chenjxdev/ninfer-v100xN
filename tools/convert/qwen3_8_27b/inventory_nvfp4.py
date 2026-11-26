@@ -25,7 +25,14 @@ device and narrowing the head saves only half of its width.
 
 from __future__ import annotations
 
+import os
+
 from . import source_profile
+
+#: Whether the artifact carries the first-generation DFlash draft (MMFlash).
+#: It is decided before import by NINFER_MMFLASH=1, because the inventory --
+#: and with it every object count -- is fixed at module load.
+CARRIES_MMFLASH = os.environ.get("NINFER_MMFLASH", "0") == "1"
 from tools.convert.qwen3_6.common.inventory import (
     BF16,
     CONTIGUOUS_LAYOUT,
@@ -245,6 +252,38 @@ def _build_draft_head_specs() -> tuple[TensorSpec, ...]:
     )
 
 
+def _build_mmflash_specs() -> tuple[TensorSpec, ...]:
+    """The first-generation DFlash draft objects.
+
+    MMFlash has no dynamic grouped convolution and no candidate selector, so
+    it contributes fewer objects than the DFlash2 package: the shared feature
+    projection, context norm and final norm, plus the five draft layers with
+    their packed query/key/value and gate/up rows.
+    """
+    hidden = 5120
+    intermediate = 17408
+    specs: list[TensorSpec] = [
+        tensor_spec("dflash/feature_projection", (hidden, 5 * hidden), W8),
+        tensor_spec("dflash/context_norm", (hidden,), BF16),
+    ]
+    for layer in range(5):
+        prefix = f"dflash/layers/{layer}/"
+        specs.extend(
+            [
+                tensor_spec(prefix + "input_norm", (hidden,), BF16),
+                tensor_spec(prefix + "attention/query_key_value", (6144, hidden), W8),
+                tensor_spec(prefix + "attention/query_norm", (128,), BF16),
+                tensor_spec(prefix + "attention/key_norm", (128,), BF16),
+                tensor_spec(prefix + "attention/output", (hidden, 4096), W8),
+                tensor_spec(prefix + "post_attention_norm", (hidden,), BF16),
+                tensor_spec(prefix + "mlp/gate_up", (2 * intermediate, hidden), W8),
+                tensor_spec(prefix + "mlp/down", (hidden, intermediate), W8),
+            ]
+        )
+    specs.append(tensor_spec("dflash/final_norm", (hidden,), BF16))
+    return tuple(specs)
+
+
 def _build_mtp_specs() -> tuple[TensorSpec, ...]:
     return (
         tensor_spec("mtp/input_projection", (5120, 10240), W8),
@@ -268,12 +307,14 @@ TEXT_CORE_TENSOR_SPECS = _build_text_core_specs()
 DRAFT_HEAD_TENSOR_SPECS = _build_draft_head_specs()
 MTP_TENSOR_SPECS = _build_mtp_specs()
 VISION_TENSOR_SPECS = build_vision_specs(5120)
+MMFLASH_TENSOR_SPECS = _build_mmflash_specs() if CARRIES_MMFLASH else ()
 
 TENSOR_SPECS = (
     TEXT_CORE_TENSOR_SPECS
     + DRAFT_HEAD_TENSOR_SPECS
     + MTP_TENSOR_SPECS
     + VISION_TENSOR_SPECS
+    + MMFLASH_TENSOR_SPECS
 )
 OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS
 
@@ -478,11 +519,14 @@ def validate_inventory() -> None:
         source_profile.ACTIVE.output_head_format,
     )
     w8_count = 3 + sum(1 for item in endpoints if item == W8)
+    mmflash_w8 = sum(1 for spec in MMFLASH_TENSOR_SPECS if spec.format == W8)
+    mmflash_bf16 = sum(1 for spec in MMFLASH_TENSOR_SPECS if spec.format == BF16)
     actual = (
         len(TEXT_CORE_TENSOR_SPECS),
         len(DRAFT_HEAD_TENSOR_SPECS),
         len(MTP_TENSOR_SPECS),
         len(VISION_TENSOR_SPECS),
+        len(MMFLASH_TENSOR_SPECS),
         len(TENSOR_SPECS),
         len(OBJECT_SPECS),
         len(NVFP4_TENSOR_SPECS),
@@ -490,43 +534,46 @@ def validate_inventory() -> None:
         len(W8_TENSOR_SPECS),
         len(INPUT_SCALE_DIVISOR_SPECS),
     )
+    draft = 43 * CARRIES_MMFLASH
     if source_profile.ACTIVE.full_nvfp4:
         # Every one of the 256 counted projections is an NVFP4 object with its
         # own input divisor -- the full-NVFP4 grade the engine recognizes.
-        expected = (915, 2, 12, 333, 1262, 1268, 256, 0, w8_count, 256)
+        expected = (915, 2, 12, 333, draft, 1262 + draft, 1268 + draft, 256, 0,
+                    w8_count + mmflash_w8, 256)
         expected_formats = {
-            BF16: 534,
+            BF16: 534 + mmflash_bf16,
             FP32: 352,
             I32: 1,
             Q4: 59,
             Q5: 54,
             Q6: 1 + sum(1 for item in endpoints if item == Q6),
-            W8: w8_count,
+            W8: w8_count + mmflash_w8,
             NVFP4: 256,
             FP8: 0,
         }
         expected_layouts = {
-            CONTIGUOUS_LAYOUT: 887,
-            ROW_SPLIT_LAYOUT: 119,
+            CONTIGUOUS_LAYOUT: 887 + mmflash_bf16,
+            ROW_SPLIT_LAYOUT: 119 + mmflash_w8,
             BLOCK_SCALE_LAYOUT: 256,
             ROW_SCALE_LAYOUT: 0,
         }
     else:
-        expected = (863, 2, 12, 333, 1210, 1216, 204, 52, w8_count, 204)
+        expected = (863, 2, 12, 333, draft, 1210 + draft, 1216 + draft, 204, 52,
+                    w8_count + mmflash_w8, 204)
         expected_formats = {
-            BF16: 534,
+            BF16: 534 + mmflash_bf16,
             FP32: 300,
             I32: 1,
             Q4: 59,
             Q5: 54,
             Q6: 1 + sum(1 for item in endpoints if item == Q6),
-            W8: w8_count,
+            W8: w8_count + mmflash_w8,
             NVFP4: 204,
             FP8: 52,
         }
         expected_layouts = {
-            CONTIGUOUS_LAYOUT: 835,
-            ROW_SPLIT_LAYOUT: 119,
+            CONTIGUOUS_LAYOUT: 835 + mmflash_bf16,
+            ROW_SPLIT_LAYOUT: 119 + mmflash_w8,
             BLOCK_SCALE_LAYOUT: 204,
             ROW_SCALE_LAYOUT: 52,
         }
@@ -537,10 +584,12 @@ def validate_inventory() -> None:
     # The engine accepts an artifact whose object count is exactly
     # 1012 + the number of NVFP4 projections, so the inventory has to land on
     # the same arithmetic.
-    if len(OBJECT_SPECS) != 1012 + len(NVFP4_TENSOR_SPECS):
+    # The engine's v3 reader selects 1012 structural objects, one per NVFP4
+    # projection, and the 43 objects of the MMFlash draft when one is carried.
+    if len(OBJECT_SPECS) != 1012 + len(NVFP4_TENSOR_SPECS) + 43 * CARRIES_MMFLASH:
         raise ValueError(
             "inventory object count does not match the engine's "
-            "1012 + NVFP4 projection rule"
+            "1012 + NVFP4 projections (+43 MMFlash) rule"
         )
     if len(INPUT_SCALE_DIVISOR_SPECS) != len(NVFP4_TENSOR_SPECS):
         raise ValueError(

@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import json
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclasses_field
 from pathlib import Path
 from typing import Iterable, Sequence, TypeAlias
 
@@ -122,11 +122,18 @@ class V3Use:
 
 @dataclass(frozen=True, slots=True)
 class V3Plan:
-    """The directory sections the engine resolves parameters through."""
+    """The directory sections the engine resolves parameters through.
+
+    A component names the resources it carries and may also carry a
+    ``config`` object: the engine validates the geometry of a draft
+    package against that configuration before it binds the package, so the
+    writer has to be able to state it.
+    """
 
     bindings: tuple[V3Binding, ...]
     uses: tuple[V3Use, ...]
     components: dict[str, dict[str, dict[str, str]]]
+    component_configs: dict[str, dict[str, object]] = dataclasses_field(default_factory=dict)
 
 
 def _payload_chunks(payload: Payload) -> Iterable[memoryview]:
@@ -159,6 +166,24 @@ def _object_json(obj: ArtifactObject) -> dict[str, object]:
     }
 
 
+def _components_json(plan: V3Plan) -> dict[str, dict[str, object]]:
+    """The components section, with each component's configuration beside its resources.
+
+    A draft package component states its ``target`` and its ``config`` at the
+    component's own level: the engine reads ``component["target"]`` and
+    ``component["config"]`` directly, so the plan's entries are spread onto
+    the component rather than nested under a single ``config`` key.
+    """
+    components: dict[str, dict[str, object]] = {
+        name: {"resources": dict(resources)}
+        for name, resources in plan.components.items()
+    }
+    for name, entries in plan.component_configs.items():
+        component = components.setdefault(name, {"resources": {}})
+        component.update(entries)
+    return components
+
+
 def encode_v3_directory(
     identity: ArtifactIdentity,
     objects: Sequence[ArtifactObject],
@@ -182,7 +207,7 @@ def encode_v3_directory(
         "objects": [_object_json(obj) for obj in objects],
         "bindings": bindings,
         "uses": [use.to_json() for use in plan.uses],
-        "components": plan.components,
+        "components": _components_json(plan),
     }
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 

@@ -652,6 +652,9 @@ def validate_recipe() -> None:
         set(GROUPED_WEIGHTS_BY_NAME),
         set(DIRECT_BY_NAME),
         set(DERIVED_RECIPES_BY_NAME),
+        # The first-generation DFlash draft comes from its own checkpoint, so
+        # the target's source routes do not own it.
+        {spec.name for spec in inventory.MMFLASH_TENSOR_SPECS},
     )
     all_names: set[str] = set()
     for names in ownership:

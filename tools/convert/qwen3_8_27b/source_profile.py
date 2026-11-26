@@ -188,15 +188,31 @@ HERETIC_PLAIN = SourceProfile(
     source_encoding="bf16",
 )
 
-# The same artifact with W8 endpoints: the engine's full-NVFP4 grade requires
-# both vocabulary endpoints in q8_g32_fp16, and the BF16 source carries no
-# redundancy at 8 bit, so W8 is a free widening rather than wasted storage.
+# The production format map in a v3 container that carries the first-generation
+# DFlash draft (MMFlash). The format map is the plain one on purpose: the
+# engine's v3 reader admits exactly 1012 structural objects + one per NVFP4
+# projection + the 43 draft objects, and this map has the 204 NVFP4 projections
+# that count lands on (1259). The draft itself is built from the MMFlash
+# checkpoint (NINFER_MMFLASH=1 --mmflash-model ...), not from this source.
+HERETIC_MMFLASH = SourceProfile(
+    name="heretic-mmflash",
+    repository="kelsey1337/DaisyRose-27B-Heretic-v2",
+    revision="78cc5e82ee867e22217f02ae30f1d26e8b953f33",
+    fp8_gdn_layers=frozenset((0, 1, 2, 4, 5, 57, 58, 60, 61, 62)),
+    fp8_full_attention=True,
+    mtp_auxiliary=None,
+    embedding_format="Q6G64_F16S",
+    output_head_format="Q6G64_F16S",
+    source_encoding="bf16",
+    container_version="v3",
+)
 
 PROFILES: dict[str, SourceProfile] = {
     QAD.name: QAD,
     DAISYROSE.name: DAISYROSE,
     HERETIC_QUASAR.name: HERETIC_QUASAR,
     HERETIC_PLAIN.name: HERETIC_PLAIN,
+    HERETIC_MMFLASH.name: HERETIC_MMFLASH,
 }
 
 _ACTIVE_NAME = os.environ.get("NINFER_NVFP4_SOURCE", QAD.name)

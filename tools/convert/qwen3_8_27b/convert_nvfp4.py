@@ -62,6 +62,7 @@ from tools.convert.qwen3_6_27b import convert as family_config
 from tools.convert.qwen3_6_27b import draft_head
 
 from . import inventory_nvfp4 as inventory
+from . import mmflash
 from . import recipe_nvfp4 as recipe
 from . import source_profile
 from . import v3_plan
@@ -75,12 +76,14 @@ RECIPE_IDS = {
     "daisyrose": "qwen3_8_27b_nvfp4-v5-radixark-daisyrose-27b-q4mtp-q6emb-q6head",
     "heretic-plain": "qwen3_8_27b_nvfp4-v6-kelsey1337-heretic-v2-q4mtp-q6emb-q6head",
     "heretic-quasar": "qwen3_8_27b_nvfp4-v6-kelsey1337-heretic-v2-q4mtp-w8emb-w8head-quasar",
+    "heretic-mmflash": "qwen3_8_27b_nvfp4-v7-kelsey1337-heretic-v2-q6emb-q6head-mmflash",
 }
 OUTPUT_BASENAMES = {
     "qad": "qwen3_8_27b_q4km_v2.ninfer",
     "daisyrose": "daisyrose_27b_nvfp4_q6emb_q6head_q4mtp.ninfer",
     "heretic-plain": "heretic_v2_27b_nvfp4_q6emb_q6head_q4mtp.ninfer",
     "heretic-quasar": "heretic_v2_27b_nvfp4_quasar_w8emb_w8head_q4mtp.ninfer",
+    "heretic-mmflash": "heretic_v2_27b_nvfp4_q6emb_q6head_mmflash.ninfer",
 }
 RECIPE_ID = RECIPE_IDS[source_profile.ACTIVE.name]
 OUTPUT_BASENAME = OUTPUT_BASENAMES[source_profile.ACTIVE.name]
@@ -605,6 +608,7 @@ def convert(
     *,
     device: str | torch.device = "cuda",
     auxiliary_dir: str | Path = AUXILIARY_MTP_REPOSITORY,
+    mmflash_model: str | Path | None = None,
 ) -> Path:
     """Run the closed single-source conversion and return its report path."""
 
@@ -616,6 +620,12 @@ def convert(
         )
     requested_device = str(device)
     resolved_device = pick_device(device)
+    if inventory.CARRIES_MMFLASH != (mmflash_model is not None):
+        raise ValueError(
+            "the inventory and the conversion disagree about the MMFlash draft: "
+            f"NINFER_MMFLASH={int(inventory.CARRIES_MMFLASH)} but "
+            f"--mmflash-model {'given' if mmflash_model else 'absent'}"
+        )
     preflight = preflight_conversion(quantized_dir, auxiliary_dir)
 
     print(
@@ -637,6 +647,13 @@ def convert(
     resources = {resource.name: resource.data for resource in preflight.resources}
     draft_ids = draft_head.materialize_draft_head_token_ids(preflight.draft)
     derived = {draft_head.DRAFT_HEAD_TOKEN_IDS_OBJECT: draft_ids}
+    # The first-generation DFlash draft (MMFlash) ships as its own checkpoint,
+    # so its objects are built from that checkpoint rather than from the
+    # target's source.
+    mmflash_payloads: dict[str, bytes] = {}
+    if mmflash_model is not None:
+        for obj in mmflash.build_mmflash_objects(mmflash_model, device=resolved_device):
+            mmflash_payloads[obj.name] = obj.payload
     with make_source_reader(
         preflight.quantized_dir, auxiliary_dir
     ) as quantized_reader:
@@ -649,6 +666,8 @@ def convert(
                 payload: bytes | Iterable[bytes]
                 if isinstance(spec, inventory.ResourceSpec):
                     payload = resources[spec.name]
+                elif spec.name in mmflash_payloads:
+                    payload = mmflash_payloads[spec.name]
                 elif spec.name in recipe.NVFP4_WEIGHTS_BY_NAME:
                     payload = _encode_nvfp4_weight(spec, quantized_reader)
                 elif spec.name in recipe.FP8_WEIGHTS_BY_NAME:
@@ -688,6 +707,7 @@ def convert(
         "out": str(out_path),
         "device": requested_device,
         "mtp_source": str(auxiliary_dir) if auxiliary_dir else None,
+        "mmflash_source": str(mmflash_model) if mmflash_model else None,
     }
     report = _build_report(
         preflight=preflight,
@@ -729,6 +749,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         default=AUXILIARY_MTP_REPOSITORY,
         help="auxiliary checkpoint providing the four MTP tensors QAD omits",
     )
+    parser.add_argument(
+        "--mmflash-model",
+        default=None,
+        type=Path,
+        help=(
+            "checkpoint providing the first-generation DFlash draft (MMFlash); "
+            "requires NINFER_MMFLASH=1 and a v3 source profile"
+        ),
+    )
     arguments = parser.parse_args(argv)
     if arguments.source != source_profile.ACTIVE.name:
         raise SystemExit(
@@ -742,6 +771,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         arguments.out,
         device=arguments.device,
         auxiliary_dir=arguments.mtp_source,
+        mmflash_model=arguments.mmflash_model,
     )
 
 
