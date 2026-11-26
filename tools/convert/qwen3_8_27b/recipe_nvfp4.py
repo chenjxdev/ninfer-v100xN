@@ -606,6 +606,9 @@ def validate_recipe() -> None:
             "a source with NVFP4 full-attention quads would need an "
             "NVFP4-to-FP8 requantization, which this recipe does not implement"
         )
+    # The first-generation DFlash draft comes from its own checkpoint, so
+    # the target's source routes do not own it.
+    mmflash_names = {spec.name for spec in inventory.MMFLASH_TENSOR_SPECS}
     ownership = (
         set(NVFP4_WEIGHTS_BY_NAME),
         set(FP8_WEIGHTS_BY_NAME),
@@ -613,6 +616,7 @@ def validate_recipe() -> None:
         set(GROUPED_WEIGHTS_BY_NAME),
         set(DIRECT_BY_NAME),
         set(DERIVED_RECIPES_BY_NAME),
+        mmflash_names,
     )
     all_names: set[str] = set()
     for names in ownership:
