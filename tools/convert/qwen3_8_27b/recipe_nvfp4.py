@@ -53,6 +53,9 @@ QUANTIZED_REVISION = source_profile.ACTIVE.revision
 # GDN layer that way) is dequantized and requantized to NVFP4 instead.
 SOURCE_FORMAT_NVFP4 = "nvfp4"
 SOURCE_FORMAT_FP8 = "fp8"
+# A checkpoint that stores plain BF16 matrices: the converter quantizes every
+# projection to NVFP4 itself instead of passing a publisher's quad through.
+SOURCE_FORMAT_BF16 = "bf16"
 
 # ModelOpt quad field suffixes on each quantized Linear base name.
 WEIGHT = "weight"              # U8 packed [N, K/2]
@@ -143,6 +146,8 @@ def _q_part(source: MatrixSource, gate: bool) -> MatrixPart:
 def _attention_source_format() -> str:
     """The publisher's format for the full-attention quads."""
 
+    if source_profile.ACTIVE.source_encoding == "bf16":
+        return SOURCE_FORMAT_BF16
     return (
         SOURCE_FORMAT_FP8
         if source_profile.ACTIVE.fp8_full_attention
@@ -158,8 +163,27 @@ def _gdn_source_format(layer: int) -> str:
     as NVFP4 is requantized from FP8.
     """
 
+    if source_profile.ACTIVE.source_encoding == "bf16":
+        # A BF16 source is quantized by the converter: the artifact's format
+        # map decides which projections become row-scaled FP8 and which stay
+        # NVFP4 block-scaled.
+        if layer in inventory.FP8_GDN_LAYERS:
+            return SOURCE_FORMAT_FP8
+        return SOURCE_FORMAT_BF16
     if layer in source_profile.ACTIVE.fp8_gdn_layers:
         return SOURCE_FORMAT_FP8
+    return SOURCE_FORMAT_NVFP4
+
+
+def _mlp_source_format() -> str:
+    """The publisher's format for the MLP quads.
+
+    Every ModelOpt export stores the MLP as NVFP4 block-scaled quads; a BF16
+    source has no quads at all, so the converter quantizes them itself.
+    """
+
+    if source_profile.ACTIVE.source_encoding == "bf16":
+        return SOURCE_FORMAT_BF16
     return SOURCE_FORMAT_NVFP4
 
 
@@ -273,12 +297,14 @@ def _build_matrix_recipes() -> tuple[
                     (34816, 5120),
                     (_all(gate), _all(up)),
                     (gate, up),
+                    _mlp_source_format(),
                 ),
                 Nvfp4WeightRecipe(
                     object_prefix + "mlp/down",
                     down.shape,
                     (_all(down),),
                     (down,),
+                    _mlp_source_format(),
                 ),
             )
         )
@@ -579,7 +605,7 @@ def _validate_matrix_recipe(
 
 
 def validate_recipe() -> None:
-    if (
+    actual = (
         len(NVFP4_WEIGHT_RECIPES),
         len(FP8_WEIGHT_RECIPES),
         len(INPUT_DIVISOR_RECIPES),
@@ -589,8 +615,18 @@ def validate_recipe() -> None:
         len(GROUPED_SOURCES),
         len(DIRECT_RECIPES),
         len(DERIVED_RECIPES),
-    ) != (204, 52, 204, 7, 306, 94, 10, 401, 342):
-        raise ValueError("mixed NVFP4/FP8 source recipe is incomplete")
+    )
+    if source_profile.ACTIVE.full_nvfp4:
+        # Every counted projection is an NVFP4 object the converter quantizes
+        # from a plain BF16 matrix: 256 projections, 256 input divisors, no
+        # FP8 passthrough and nothing to requantize.
+        expected = (256, 0, 256, 7, 400, 0, 10, 401, 342)
+    else:
+        expected = (204, 52, 204, 7, 306, 94, 10, 401, 342)
+    if actual != expected:
+        raise ValueError(
+            f"mixed NVFP4/FP8 source recipe is incomplete: {actual} != {expected}"
+        )
     # Layers the publisher exported as FP8 but the artifact stores as NVFP4
     # are requantized; each contributes its qkv, z and output source quads.
     requantized_layers = (
@@ -601,7 +637,10 @@ def validate_recipe() -> None:
         raise ValueError(
             "requantized source count does not match the source profile"
         )
-    if not source_profile.ACTIVE.fp8_full_attention:
+    if (
+        not source_profile.ACTIVE.fp8_full_attention
+        and source_profile.ACTIVE.source_encoding != "bf16"
+    ):
         raise ValueError(
             "a source with NVFP4 full-attention quads would need an "
             "NVFP4-to-FP8 requantization, which this recipe does not implement"
@@ -646,9 +685,10 @@ def validate_recipe() -> None:
     bound_weights = tuple(
         name for site in INPUT_DIVISOR_RECIPES for name in site.weight_names
     )
+    expected_bound = len(NVFP4_WEIGHTS_BY_NAME)
     if (
-        len(bound_weights) != 204
-        or len(set(bound_weights)) != 204
+        len(bound_weights) != expected_bound
+        or len(set(bound_weights)) != expected_bound
         or set(bound_weights) != set(NVFP4_WEIGHTS_BY_NAME)
     ):
         raise ValueError("input-divisor sites do not cover NVFP4 parents once")
@@ -710,19 +750,74 @@ def quantize_matrix_to_nvfp4(
     return packed, scales_e4m3, scale_2
 
 
+def quantize_matrix_to_fp8_rows(
+    matrix: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a BF16 [N, K] matrix to row-scaled E4M3FN codes.
+
+    One BF16 multiplier per row: the row's amax maps onto the E4M3FN rail
+    (448), so the stored row scale is a multiplier (W = e4m3 * scale), which
+    is the convention the artifact's row-scale-v1 payload uses.
+    """
+
+    wf = matrix.to(torch.float32)
+    amax = wf.abs().amax(dim=1)
+    scale = (amax / 448.0).to(torch.bfloat16).to(torch.float32)
+    scale = torch.where(
+        scale > 0.0, scale, torch.full_like(scale, 2.0**-24)
+    )
+    normalized = (wf / scale.unsqueeze(1)).clamp(-448.0, 448.0)
+    codes = normalized.to(torch.float8_e4m3fn)
+    return codes.view(torch.uint8), scale.to(torch.bfloat16)
+
+
+def _quantize_bf16_to_fp8_rows(
+    recipe: Nvfp4WeightRecipe,
+    reader: ShardReader,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a plain BF16 source matrix into the artifact's FP8 object."""
+
+    row_parts: list[torch.Tensor] = []
+    source_cache: dict[MatrixSource, torch.Tensor] = {}
+    for part in recipe.parts:
+        rows = source_cache.get(part.source)
+        if rows is None:
+            n, k = part.source.shape
+            rows = reader.get(part.source.field(WEIGHT))
+            if rows.dtype != torch.bfloat16 or tuple(rows.shape) != (n, k):
+                raise ValueError(
+                    f"{part.source.name}: BF16 FP8 source signature mismatch"
+                )
+            source_cache[part.source] = rows
+        row_parts.append(_select_rows(rows, part))
+    fused = _fuse(row_parts)
+    del row_parts
+    if tuple(fused.shape) != recipe.shape:
+        raise ValueError(f"{recipe.object_name}: materialized FP8 shape mismatch")
+    codes, scales = quantize_matrix_to_fp8_rows(fused)
+    del fused
+    return codes, scales
+
+
 def materialize_fp8_weight(
     recipe: Nvfp4WeightRecipe,
     reader: ShardReader,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """FP8 byte passthrough into the artifact's row-scaled FP8 storage.
 
-    ModelOpt FP8 per-tensor quads (``weight`` F8E4M3 [N,K], ``weight_scale``
-    F32 scalar) satisfy ``W = e4m3 * weight_scale``. The row-scale-v1 payload
+    ModelOpt FP8 per-tensor quads (``weight`` F8E4M3 [N,K], scalar F32
+    weight_scale) satisfy ``W = e4m3 * weight_scale``. The row-scale-v1 payload
     is exactly these code words plus a BF16 per-row multiplier, so each fused
     part's row range carries its own source scale. Code bytes stay
     bit-identical; the only numerical change is the scalar broadcast rounding
     F32 -> BF16 (<= 2^-8 relative; 89 of 94 QAD scalars are not BF16-exact).
+
+    A BF16 source has no code words to pass through: the converter quantizes
+    the rows itself, one BF16 multiplier per row.
     """
+
+    if source_profile.ACTIVE.source_encoding == "bf16":
+        return _quantize_bf16_to_fp8_rows(recipe, reader)
 
     code_parts: list[torch.Tensor] = []
     scale_parts: list[torch.Tensor] = []
@@ -813,6 +908,8 @@ def materialize_nvfp4_weight(
 
     if recipe.source_format == SOURCE_FORMAT_FP8:
         return _requantize_fp8_to_nvfp4(recipe, reader)
+    if recipe.source_format == SOURCE_FORMAT_BF16:
+        return _quantize_bf16_to_nvfp4(recipe, reader)
 
     packed_parts: list[torch.Tensor] = []
     scale_parts: list[torch.Tensor] = []
@@ -916,10 +1013,61 @@ def _requantize_fp8_to_nvfp4(
     return packed, scales.view(torch.uint8), struct.pack("<f", divisor)
 
 
+def _quantize_bf16_to_nvfp4(
+    recipe: Nvfp4WeightRecipe,
+    reader: ShardReader,
+) -> tuple[torch.Tensor, torch.Tensor, bytes]:
+    """Quantize a plain BF16 source matrix into the artifact's NVFP4 object.
+
+    A BF16 checkpoint stores no ModelOpt quad, so the converter does the
+    quantization itself with the rule a publisher's own NVFP4 quads follow:
+    per-16-element block scales in e4m3 with the per-tensor multiplier
+    ``s2 = amax/448``. The artifact stores the RECIPROCAL of s2, because the
+    engine's NVFP4 kernels divide by the stored divisor while the
+    quantization multiplies by s2.
+    """
+
+    row_parts: list[torch.Tensor] = []
+    source_cache: dict[MatrixSource, torch.Tensor] = {}
+    for part in recipe.parts:
+        rows = source_cache.get(part.source)
+        if rows is None:
+            n, k = part.source.shape
+            rows = reader.get(part.source.field(WEIGHT))
+            if rows.dtype != torch.bfloat16 or tuple(rows.shape) != (n, k):
+                raise ValueError(
+                    f"{part.source.name}: BF16 source signature mismatch"
+                )
+            source_cache[part.source] = rows
+        row_parts.append(_select_rows(rows, part))
+    fused = _fuse(row_parts)
+    del row_parts
+    if tuple(fused.shape) != recipe.shape:
+        raise ValueError(
+            f"{recipe.object_name}: materialized NVFP4 shape mismatch"
+        )
+    packed, scales, scale_2 = quantize_matrix_to_nvfp4(fused)
+    del fused
+    divisor = 1.0 / scale_2
+    if not (divisor > 0.0 and divisor < float("inf")):
+        raise ValueError(f"{recipe.object_name}: reciprocal weight scale is invalid")
+    # The artifact stores the block scales as their raw F8E4M3 bytes.
+    return packed, scales.view(torch.uint8), struct.pack("<f", divisor)
+
+
 def materialize_input_divisor(
     recipe: InputDivisorRecipe,
     reader: ShardReader,
 ) -> torch.Tensor:
+    if source_profile.ACTIVE.source_encoding == "bf16":
+        # A BF16 source carries no activation calibration, and the divisor
+        # cancels exactly in the engine's NVFP4 kernels: the runtime
+        # activation block scale is built as divisor * max_abs / 6 and the
+        # weight side carries its reciprocal, so the product is invariant.
+        # What the divisor still decides is the e4m3 range of the runtime
+        # activation scale; 1.0 keeps it at max_abs / 6, the natural choice
+        # for an FP4 activation, and needs no calibration data.
+        return torch.tensor(1.0, dtype=torch.float32)
     word = _same_divisor(reader, recipe.sources, INPUT_SCALE)
     return torch.frombuffer(
         bytearray(struct.pack("<I", word)), dtype=torch.float32
@@ -979,6 +1127,20 @@ def _merge_requirement(
 
 def _source_requirements() -> dict[str, tuple[tuple[int, ...], str]]:
     result: dict[str, tuple[tuple[int, ...], str]] = {}
+    if source_profile.ACTIVE.source_encoding == "bf16":
+        # A BF16 source stores plain matrices: one BF16 tensor per Linear,
+        # with no per-tensor quad fields at all.
+        for source in (*NVFP4_SOURCES, *FP8_SOURCES):
+            n, k = source.shape
+            _merge_requirement(result, source.field(WEIGHT), (n, k), "BF16")
+        for source in GROUPED_SOURCES:
+            n, k = source.shape
+            _merge_requirement(result, source.field(WEIGHT), (n, k), "BF16")
+        for source in family_recipe.source_requirements(DIRECT_RECIPES).values():
+            _merge_requirement(result, source.name, source.shape, source.dtype)
+        for source in family_recipe.source_requirements(DERIVED_RECIPES).values():
+            _merge_requirement(result, source.name, source.shape, source.dtype)
+        return result
     for source in NVFP4_NATIVE_SOURCES:
         n, k = source.shape
         _merge_requirement(result, source.field(WEIGHT), (n, k // 2), "U8")
@@ -1048,6 +1210,35 @@ def preflight_quantized_metadata(
     missing = set(SOURCE_REQUIREMENTS).difference(reader.names)
     if missing:
         raise ValueError(f"quantized source is missing {sorted(missing)[0]}")
+    if source_profile.ACTIVE.source_encoding == "bf16":
+        # A BF16 source has no quad fields, so the closed-field check below
+        # (which admits only declared ModelOpt members) does not apply: the
+        # declared signature of every consumed tensor is checked instead.
+        metadata = reader.metadata(reader.names)
+        dtype_counts: dict[str, int] = {}
+        shards: set[str] = set()
+        for name, (shape, dtype) in SOURCE_REQUIREMENTS.items():
+            actual = metadata[name]
+            if not _signature_matches(shape, dtype, actual):
+                raise ValueError(
+                    f"{name}: source signature {(actual.shape, actual.dtype)} "
+                    f"!= {(shape, dtype)}"
+                )
+            dtype_counts[actual.dtype] = dtype_counts.get(actual.dtype, 0) + 1
+            shards.add(actual.shard)
+        return family_recipe.SourcePreflight(
+            recipe_count=(
+                len(NVFP4_WEIGHT_RECIPES)
+                + len(FP8_WEIGHT_RECIPES)
+                + len(INPUT_DIVISOR_RECIPES)
+                + len(GROUPED_WEIGHT_RECIPES)
+                + len(DIRECT_RECIPES)
+                + len(DERIVED_RECIPES)
+            ),
+            source_tensor_count=len(SOURCE_REQUIREMENTS),
+            source_shard_count=len(shards),
+            source_dtype_counts=dtype_counts,
+        )
     # QAD mixed precision is pinned by the closed recipe: the FP8 quad set is
     # declared with exact signatures (weight F8E4M3 [N,K], scalar F32
     # weight_scale, input_scale F32[1]) and the NVFP4 quads with theirs, so a

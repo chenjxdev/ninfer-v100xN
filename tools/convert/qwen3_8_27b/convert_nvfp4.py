@@ -49,6 +49,7 @@ from tools.artifact.container import (
     ArtifactObject,
     ArtifactWriter,
 )
+from tools.artifact.container_v3 import V3ArtifactWriter
 from tools.artifact.layouts import (
     encode_direct,
     encode_fp8_row_scaled,
@@ -63,6 +64,7 @@ from tools.convert.qwen3_6_27b import draft_head
 from . import inventory_nvfp4 as inventory
 from . import recipe_nvfp4 as recipe
 from . import source_profile
+from . import v3_plan
 
 
 # Each source profile is a closed recipe: its own recipe id, its own output
@@ -71,10 +73,14 @@ from . import source_profile
 RECIPE_IDS = {
     "qad": "qwen3_8_27b_nvfp4-v5-nvidia-qad-q4mtp-q6emb-w8head",
     "daisyrose": "qwen3_8_27b_nvfp4-v5-radixark-daisyrose-27b-q4mtp-q6emb-q6head",
+    "heretic-plain": "qwen3_8_27b_nvfp4-v6-kelsey1337-heretic-v2-q4mtp-q6emb-q6head",
+    "heretic-quasar": "qwen3_8_27b_nvfp4-v6-kelsey1337-heretic-v2-q4mtp-w8emb-w8head-quasar",
 }
 OUTPUT_BASENAMES = {
     "qad": "qwen3_8_27b_q4km_v2.ninfer",
     "daisyrose": "daisyrose_27b_nvfp4_q6emb_q6head_q4mtp.ninfer",
+    "heretic-plain": "heretic_v2_27b_nvfp4_q6emb_q6head_q4mtp.ninfer",
+    "heretic-quasar": "heretic_v2_27b_nvfp4_quasar_w8emb_w8head_q4mtp.ninfer",
 }
 RECIPE_ID = RECIPE_IDS[source_profile.ACTIVE.name]
 OUTPUT_BASENAME = OUTPUT_BASENAMES[source_profile.ACTIVE.name]
@@ -239,6 +245,67 @@ class QadSourceReader:
             self._auxiliary.close()
         self._lm_head = None
 
+
+class HereticSourceReader:
+    """ShardReader overlay for a plain BF16 checkpoint with no MTP tensors.
+
+    The ablation checkpoint stores every Linear as a BF16 matrix -- there are
+    no ModelOpt quads to pass through -- and it dropped the draft layer on
+    save, so the MTP tensors resolve to the auxiliary checkpoint. Everything
+    else delegates to the wrapped reader.
+    """
+
+    def __init__(
+        self,
+        model_dir: str | Path,
+        auxiliary_dir: str | Path | None = AUXILIARY_MTP_REPOSITORY,
+    ) -> None:
+        self._reader = ShardReader(model_dir)
+        self._auxiliary_dir = Path(auxiliary_dir) if auxiliary_dir else None
+        self._auxiliary = None
+
+    @property
+    def names(self):
+        base = set(self._reader.names)
+        if self._auxiliary_dir is not None:
+            base.update(AUXILIARY_MTP_FIELDS)
+        return tuple(sorted(base))
+
+    def has(self, name: str) -> bool:
+        if self._reader.has(name):
+            return True
+        return (
+            self._auxiliary_dir is not None and name in AUXILIARY_MTP_FIELDS
+        )
+
+    def _auxiliary_reader(self) -> ShardReader:
+        if self._auxiliary is None:
+            if self._auxiliary_dir is None:
+                raise KeyError("no auxiliary checkpoint configured")
+            self._auxiliary = ShardReader(self._auxiliary_dir)
+        return self._auxiliary
+
+    def get(self, name: str) -> torch.Tensor:
+        if self._reader.has(name):
+            return self._reader.get(name)
+        if self._auxiliary_dir is not None and name in AUXILIARY_MTP_FIELDS:
+            return self._auxiliary_reader().get(name)
+        raise KeyError(name)
+
+    def metadata(self, names):
+        plain = [name for name in names if self._reader.has(name)]
+        result = dict(self._reader.metadata(plain)) if plain else {}
+        virtual = [name for name in names if name not in result]
+        if virtual:
+            auxiliary = self._auxiliary_reader()
+            result.update(auxiliary.metadata(virtual))
+        return result
+
+    def close(self) -> None:
+        self._reader.close()
+        if self._auxiliary is not None:
+            self._auxiliary.close()
+
     def __enter__(self):
         return self
 
@@ -352,6 +419,35 @@ def build_object_plan(
     return family_conversion.build_object_plan(inventory.OBJECT_SPECS, resources)
 
 
+def make_source_reader(
+    model_dir: str | Path,
+    auxiliary_dir: str | Path | None,
+):
+    """The source reader the active profile needs."""
+
+    if source_profile.ACTIVE.source_encoding == "bf16":
+        return HereticSourceReader(model_dir, auxiliary_dir)
+    return QadSourceReader(model_dir, auxiliary_dir)
+
+
+def _make_writer(output: Path, specs):
+    """The artifact writer the active profile needs.
+
+    The v3 container carries the logical-parameter bindings, the activation
+    input divisor of every NVFP4 projection and the frontend resources; the
+    engine's QUASAR adapter reads them from there.
+    """
+
+    identity = ArtifactIdentity(
+        inventory.MODEL_ID, source_profile.ACTIVE.weights_id
+    )
+    if source_profile.ACTIVE.container_version == "v3":
+        return V3ArtifactWriter(
+            output, identity, specs, v3_plan.build_plan(specs)
+        )
+    return ArtifactWriter(output, identity, specs)
+
+
 def preflight_conversion(
     quantized_dir: str | Path,
     auxiliary_dir: str | Path = AUXILIARY_MTP_REPOSITORY,
@@ -360,27 +456,30 @@ def preflight_conversion(
     _validate_index(quantized)
 
     config = family_conversion.load_json(quantized / "config.json")
-    quantization = config.get("quantization_config", {})
-    if quantization.get("quant_method") not in (None, "modelopt", "quantize"):
-        # ModelOpt checkpoints may carry no quantization_config at all in
-        # config.json (hf_quant_config.json is authoritative); accept both.
-        raise ValueError(
-            f"unexpected quant_method {quantization.get('quant_method')!r}"
+    if source_profile.ACTIVE.source_encoding != "bf16":
+        quantization = config.get("quantization_config", {})
+        if quantization.get("quant_method") not in (None, "modelopt", "quantize"):
+            # ModelOpt checkpoints may carry no quantization_config at all in
+            # config.json (hf_quant_config.json is authoritative); accept both.
+            raise ValueError(
+                f"unexpected quant_method {quantization.get('quant_method')!r}"
+            )
+        quant_config = family_conversion.load_json(
+            quantized / "hf_quant_config.json"
         )
-    quant_config = family_conversion.load_json(quantized / "hf_quant_config.json")
-    if quant_config.get("producer", {}).get("name") != "modelopt":
-        raise ValueError("hf_quant_config.json producer is not modelopt")
-    # NVIDIA QAD exports declare MIXED_PRECISION (per-layer recipe in
-    # exclude_modules); plain NVFP4 QAT checkpoints declare NVFP4.
-    if quant_config.get("quantization", {}).get("quant_algo") not in (
-        "NVFP4",
-        "MIXED_PRECISION",
-    ):
-        raise ValueError("hf_quant_config.json quant_algo is not NVFP4")
+        if quant_config.get("producer", {}).get("name") != "modelopt":
+            raise ValueError("hf_quant_config.json producer is not modelopt")
+        # NVIDIA QAD exports declare MIXED_PRECISION (per-layer recipe in
+        # exclude_modules); plain NVFP4 QAT checkpoints declare NVFP4.
+        if quant_config.get("quantization", {}).get("quant_algo") not in (
+            "NVFP4",
+            "MIXED_PRECISION",
+        ):
+            raise ValueError("hf_quant_config.json quant_algo is not NVFP4")
     config_summary = family_config.validate_config(config)
     preflight_inventory()
 
-    with QadSourceReader(quantized, auxiliary_dir) as quantized_reader:
+    with make_source_reader(quantized, auxiliary_dir) as quantized_reader:
         quantized_source = recipe.preflight_quantized_metadata(quantized_reader)
 
     resources = load_resources(quantized)
@@ -466,7 +565,9 @@ def _build_report(
 ) -> dict[str, object]:
     ranking = _repo_root() / draft_head.DEFAULT_RANKING
     report = family_conversion.build_conversion_report(
-        identity=ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
+        identity=ArtifactIdentity(
+            inventory.MODEL_ID, source_profile.ACTIVE.weights_id
+        ),
         target_key=inventory.TARGET_KEY,
         recipe_id=RECIPE_ID,
         repo_root=_repo_root(),
@@ -536,14 +637,10 @@ def convert(
     resources = {resource.name: resource.data for resource in preflight.resources}
     draft_ids = draft_head.materialize_draft_head_token_ids(preflight.draft)
     derived = {draft_head.DRAFT_HEAD_TOKEN_IDS_OBJECT: draft_ids}
-    with QadSourceReader(
+    with make_source_reader(
         preflight.quantized_dir, auxiliary_dir
     ) as quantized_reader:
-        with ArtifactWriter(
-            output,
-            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
-            preflight.object_plan.specs,
-        ) as writer:
+        with _make_writer(output, preflight.object_plan.specs) as writer:
             if writer.objects != preflight.object_plan.objects:
                 raise RuntimeError(
                     "writer object plan differs from completed preflight"

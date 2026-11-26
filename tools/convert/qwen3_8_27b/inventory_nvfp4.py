@@ -67,7 +67,22 @@ GDN_LAYERS = tuple(
 )
 # The ten GDN layers whose attention quads ModelOpt exported as FP8
 # per-tensor instead of NVFP4 (verified against the QAD shard metadata).
-FP8_GDN_LAYERS = (0, 1, 2, 4, 5, 57, 58, 60, 61, 62)
+# The profile's artifact_fp8_gdn_layers says where the artifact keeps FP8;
+# None means the production format map above.
+FP8_GDN_LAYERS = tuple(
+    sorted(
+        source_profile.ACTIVE.artifact_fp8_gdn_layers
+        if source_profile.ACTIVE.artifact_fp8_gdn_layers is not None
+        else (0, 1, 2, 4, 5, 57, 58, 60, 61, 62)
+    )
+)
+# The full-attention projections follow the artifact's format map: the
+# production map keeps them FP8 (row-scaled, no input divisor), the
+# full-NVFP4 map quantizes them to NVFP4 (block-scaled, one input divisor
+# per projection).
+ATTENTION_PROJECTION_FORMAT = (
+    FP8 if source_profile.ACTIVE.fp8_full_attention else NVFP4
+)
 
 
 def tensor_spec(
@@ -100,22 +115,44 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
         prefix = f"text/layers/{layer}/"
         specs.append(tensor_spec(prefix + "input_norm", (5120,), BF16))
         if layer in FULL_ATTENTION_LAYERS:
-            # QAD stores every full-attention quad as ModelOpt FP8: both
-            # projections pass through as row-scaled FP8 (no input divisor).
+            # A ModelOpt publisher may export every full-attention quad as
+            # FP8: both projections pass through as row-scaled FP8 and carry
+            # no input divisor. A BF16 source is quantized to NVFP4 instead,
+            # which needs the two input divisors like every other NVFP4
+            # projection.
             specs.extend(
                 (
                     tensor_spec(
                         prefix + "attention/query_key_gate_value",
                         (14336, 5120),
-                        FP8,
+                        ATTENTION_PROJECTION_FORMAT,
                     ),
                     tensor_spec(prefix + "attention/query_norm", (256,), BF16),
                     tensor_spec(prefix + "attention/key_norm", (256,), BF16),
                     tensor_spec(
-                        prefix + "attention/output", (5120, 6144), FP8
+                        prefix + "attention/output",
+                        (5120, 6144),
+                        ATTENTION_PROJECTION_FORMAT,
                     ),
                 )
             )
+            if ATTENTION_PROJECTION_FORMAT == NVFP4:
+                specs.extend(
+                    (
+                        tensor_spec(
+                            prefix
+                            + "attention/input_projection/input_scale_divisor",
+                            (),
+                            FP32,
+                        ),
+                        tensor_spec(
+                            prefix
+                            + "attention/output_projection/input_scale_divisor",
+                            (),
+                            FP32,
+                        ),
+                    )
+                )
         elif layer in FP8_GDN_LAYERS:
             # Ten GDN layers share the same FP8 treatment.
             specs.extend(
@@ -441,7 +478,7 @@ def validate_inventory() -> None:
         source_profile.ACTIVE.output_head_format,
     )
     w8_count = 3 + sum(1 for item in endpoints if item == W8)
-    if (
+    actual = (
         len(TEXT_CORE_TENSOR_SPECS),
         len(DRAFT_HEAD_TENSOR_SPECS),
         len(MTP_TENSOR_SPECS),
@@ -452,29 +489,68 @@ def validate_inventory() -> None:
         len(FP8_TENSOR_SPECS),
         len(W8_TENSOR_SPECS),
         len(INPUT_SCALE_DIVISOR_SPECS),
-    ) != (863, 2, 12, 333, 1210, 1216, 204, 52, w8_count, 204):
-        raise ValueError("registered Qwen3.8 mixed-NVFP4 inventory is incomplete")
-    expected_formats = {
-        BF16: 534,
-        FP32: 300,
-        I32: 1,
-        Q4: 59,
-        Q5: 54,
-        Q6: 1 + sum(1 for item in endpoints if item == Q6),
-        W8: w8_count,
-        NVFP4: 204,
-        FP8: 52,
-    }
+    )
+    if source_profile.ACTIVE.full_nvfp4:
+        # Every one of the 256 counted projections is an NVFP4 object with its
+        # own input divisor -- the full-NVFP4 grade the engine recognizes.
+        expected = (915, 2, 12, 333, 1262, 1268, 256, 0, w8_count, 256)
+        expected_formats = {
+            BF16: 534,
+            FP32: 352,
+            I32: 1,
+            Q4: 59,
+            Q5: 54,
+            Q6: 1 + sum(1 for item in endpoints if item == Q6),
+            W8: w8_count,
+            NVFP4: 256,
+            FP8: 0,
+        }
+        expected_layouts = {
+            CONTIGUOUS_LAYOUT: 887,
+            ROW_SPLIT_LAYOUT: 119,
+            BLOCK_SCALE_LAYOUT: 256,
+            ROW_SCALE_LAYOUT: 0,
+        }
+    else:
+        expected = (863, 2, 12, 333, 1210, 1216, 204, 52, w8_count, 204)
+        expected_formats = {
+            BF16: 534,
+            FP32: 300,
+            I32: 1,
+            Q4: 59,
+            Q5: 54,
+            Q6: 1 + sum(1 for item in endpoints if item == Q6),
+            W8: w8_count,
+            NVFP4: 204,
+            FP8: 52,
+        }
+        expected_layouts = {
+            CONTIGUOUS_LAYOUT: 835,
+            ROW_SPLIT_LAYOUT: 119,
+            BLOCK_SCALE_LAYOUT: 204,
+            ROW_SCALE_LAYOUT: 52,
+        }
+    if actual != expected:
+        raise ValueError(
+            f"registered Qwen3.8 mixed-NVFP4 inventory is incomplete: {actual} != {expected}"
+        )
+    # The engine accepts an artifact whose object count is exactly
+    # 1012 + the number of NVFP4 projections, so the inventory has to land on
+    # the same arithmetic.
+    if len(OBJECT_SPECS) != 1012 + len(NVFP4_TENSOR_SPECS):
+        raise ValueError(
+            "inventory object count does not match the engine's "
+            "1012 + NVFP4 projection rule"
+        )
+    if len(INPUT_SCALE_DIVISOR_SPECS) != len(NVFP4_TENSOR_SPECS):
+        raise ValueError(
+            "every NVFP4 projection needs exactly one input scale divisor"
+        )
     if FORMAT_COUNTS != expected_formats:
         raise ValueError(
             f"unexpected numeric allocation: {FORMAT_COUNTS} != {expected_formats}"
         )
-    if LAYOUT_COUNTS != {
-        CONTIGUOUS_LAYOUT: 835,
-        ROW_SPLIT_LAYOUT: 119,
-        BLOCK_SCALE_LAYOUT: 204,
-        ROW_SCALE_LAYOUT: 52,
-    }:
+    if LAYOUT_COUNTS != expected_layouts:
         raise ValueError(f"unexpected layout allocation: {LAYOUT_COUNTS}")
 
 

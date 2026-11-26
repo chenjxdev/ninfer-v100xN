@@ -62,9 +62,50 @@ class SourceProfile:
     #: NVFP4 too, so an 8-bit head stores four bits of redundancy per weight.
     embedding_format: str = "Q6G64_F16S"
     output_head_format: str = "W8G32_F16S"
+    #: How the checkpoint stores its weights. ``modelopt`` means every Linear
+    #: is a ModelOpt quad (packed weight + block scales + per-tensor
+    #: multiplier + input scale); ``bf16`` means plain BF16 matrices that the
+    #: converter quantizes to NVFP4 itself (per-16-element e4m3 block scales,
+    #: per-tensor multiplier ``amax/448``).
+    source_encoding: str = "modelopt"
+    #: The container the artifact is written in: ``v2`` (a flat object list)
+    #: or ``v3`` (objects + bindings + uses + components).
+    container_version: str = "v2"
+    #: The weights identity the engine maps to a weights profile. The engine
+    #: registers the full-NVFP4 (all-NVFP4 projections, W8 endpoints) format
+    #: map as ``quasar-nvfp4``; ``nvfp4`` is the mixed NVFP4/FP8 map.
+    weights_id: str = "nvfp4"
+    #: The GDN layers the ARTIFACT stores as row-scaled FP8. None means the
+    #: production format map: ten layers. The publisher's own FP8 export
+    #: (``fp8_gdn_layers``) is a different thing -- it says where the
+    #: checkpoint shipped FP8, not where the artifact keeps FP8.
+    artifact_fp8_gdn_layers: frozenset[int] | None = None
+    #: Whether every counted projection is an NVFP4 object (the full-NVFP4
+    #: format map the engine registers as ``quasar-nvfp4``).
+    full_nvfp4: bool = False
 
     @property
     def mtp_auxiliary_fields(self) -> tuple[str, ...]:
+        if self.source_encoding == "bf16":
+            # A BF16 checkpoint ships no MTP tensors at all, so the auxiliary
+            # checkpoint provides the complete draft layer.
+            return (
+                "mtp.fc.weight",
+                "mtp.layers.0.input_layernorm.weight",
+                "mtp.layers.0.mlp.down_proj.weight",
+                "mtp.layers.0.mlp.gate_proj.weight",
+                "mtp.layers.0.mlp.up_proj.weight",
+                "mtp.layers.0.post_attention_layernorm.weight",
+                "mtp.layers.0.self_attn.k_norm.weight",
+                "mtp.layers.0.self_attn.k_proj.weight",
+                "mtp.layers.0.self_attn.o_proj.weight",
+                "mtp.layers.0.self_attn.q_norm.weight",
+                "mtp.layers.0.self_attn.q_proj.weight",
+                "mtp.layers.0.self_attn.v_proj.weight",
+                "mtp.norm.weight",
+                "mtp.pre_fc_norm_embedding.weight",
+                "mtp.pre_fc_norm_hidden.weight",
+            )
         return (
             "mtp.fc.weight",
             "mtp.pre_fc_norm_embedding.weight",
@@ -101,9 +142,61 @@ DAISYROSE = SourceProfile(
     output_head_format="Q6G64_F16S",
 )
 
+# kelsey1337/DaisyRose-27B-Heretic-v2 is the ablation of RadixArk/DaisyRose-27B
+# shipped as plain BF16: no ModelOpt quads at all, so every projection is
+# quantized to NVFP4 by the converter itself and every one of the 256 counted
+# projections is an NVFP4 object (the full-NVFP4 grade the engine recognizes).
+# The checkpoint carries no MTP tensors -- the ablation tool dropped the draft
+# layer on save -- so the auxiliary checkpoint supplies all fifteen of them.
+
+# The same artifact as the QUASAR weights profile: every one of the 256
+# counted projections is an NVFP4 object and both vocabulary endpoints are
+# W8, which is the format map the engine's QUASAR adapter binds and the only
+# one that unlocks --volta-fast-decode. The engine registers that profile by
+# the container identity (the sixteen bytes at offset 16 of a v3 container),
+# so the artifact is written in the v3 container.
+HERETIC_QUASAR = SourceProfile(
+    name="heretic-quasar",
+    repository="kelsey1337/DaisyRose-27B-Heretic-v2",
+    revision="78cc5e82ee867e22217f02ae30f1d26e8b953f33",
+    fp8_gdn_layers=frozenset(),
+    fp8_full_attention=False,
+    mtp_auxiliary=None,
+    embedding_format="W8G32_F16S",
+    output_head_format="W8G32_F16S",
+    source_encoding="bf16",
+    container_version="v3",
+    weights_id="quasar-nvfp4",
+    artifact_fp8_gdn_layers=frozenset(),
+    full_nvfp4=True,
+)
+
+# The production format map over a BF16 source: the attention projections and
+# ten GDN layers are row-scaled FP8, every other projection is NVFP4, both
+# vocabulary endpoints are Q6 and the MTP matrices are Q4 -- exactly the map
+# of the production artifact, so the engine binds it the same way (the mixed
+# ``nvfp4`` weights profile) and the same start-up flags apply.
+HERETIC_PLAIN = SourceProfile(
+    name="heretic-plain",
+    repository="kelsey1337/DaisyRose-27B-Heretic-v2",
+    revision="78cc5e82ee867e22217f02ae30f1d26e8b953f33",
+    fp8_gdn_layers=frozenset((0, 1, 2, 4, 5, 57, 58, 60, 61, 62)),
+    fp8_full_attention=True,
+    mtp_auxiliary=None,
+    embedding_format="Q6G64_F16S",
+    output_head_format="Q6G64_F16S",
+    source_encoding="bf16",
+)
+
+# The same artifact with W8 endpoints: the engine's full-NVFP4 grade requires
+# both vocabulary endpoints in q8_g32_fp16, and the BF16 source carries no
+# redundancy at 8 bit, so W8 is a free widening rather than wasted storage.
+
 PROFILES: dict[str, SourceProfile] = {
     QAD.name: QAD,
     DAISYROSE.name: DAISYROSE,
+    HERETIC_QUASAR.name: HERETIC_QUASAR,
+    HERETIC_PLAIN.name: HERETIC_PLAIN,
 }
 
 _ACTIVE_NAME = os.environ.get("NINFER_NVFP4_SOURCE", QAD.name)
