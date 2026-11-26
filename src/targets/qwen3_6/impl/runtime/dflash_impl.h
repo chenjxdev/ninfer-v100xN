@@ -56,6 +56,13 @@ void MMFlashTrace::write(const std::string& name, const Tensor& tensor, cudaStre
     if (!enabled()) { return; }
     const char* root = std::getenv("NINFER_MMFLASH_TRACE");
     if (root == nullptr) { return; }
+    // A CUDA graph capture cannot be synchronized with, so the trace only
+    // runs outside a capture.
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) {
+        return;
+    }
     const std::string path = std::string(root) + "." + name + ".bin";
     const std::size_t size = tensor.bytes();
     if (size == 0) { return; }
@@ -214,6 +221,10 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
         Tensor context = context_roots.normalized;
         ops::rmsnorm(projected, state.execution.model.dflash->context_norm, Config::rms_epsilon,
                      false, context, state.execution.device.stream);
+        if (MMFlashTrace::enabled()) {
+            MMFlashTrace::write("context_features", features, state.execution.device.stream);
+            MMFlashTrace::write("context_projected", context, state.execution.device.stream);
+        }
 
         // The first-generation draft attends over the whole context, so every
         // one of its layers writes into the paged full-context cache.  The
@@ -647,6 +658,17 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         state.execution.work.reset();
         Tensor compact_features = state.execution.work.alloc(
             DType::BF16, {Variant::DFlashConfig::feature_rows, width, batch_size});
+        if (MMFlashTrace::enabled()) {
+            // The pending buffer, before it is compacted: if it holds only the
+            // first tap, the capture wrote the other four somewhere else.
+            Tensor pending = dflash_state(state).pending_features.slice(2, 0, 1);
+            MMFlashTrace::write("pending_features", pending, state.execution.device.stream);
+        }
+        if (MMFlashTrace::enabled()) {
+            MMFlashTrace::write("pending_all",
+                                 dflash_state(state).pending_features,
+                                 state.execution.device.stream);
+        }
         ops::prepare_ragged_prefix(dflash_state(state).pending_features, lanes, context_starts,
                                    frontiers, compact_features, append_positions, append_counts,
                                    state.execution.device.stream);

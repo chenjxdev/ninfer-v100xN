@@ -1172,6 +1172,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         const bool has_convolution = binder.has_tensor("dflash/layers/0/attention_conv/base_kernel");
         const bool has_selector = binder.has_tensor("dflash/candidate_selector/hidden_projection");
         out.dflash.first_generation = !has_convolution && !has_selector;
+        out.dflash.has_convolution = has_convolution;
+        out.dflash.has_selector = has_selector;
         out.dflash.projection_format = (weights_profile == WeightsProfile::Qwen38Nvfp4 || quasar)
                                             ? NumericFormat::W8G32_F16S : NumericFormat::BF16;
         const artifact::TensorPlacement dflash_placement =
@@ -1200,7 +1202,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
             target.post_attention_norm = bind_dflash(prefix + "post_attention_norm", {5120});
             target.gate_up = bind_projection(prefix + "mlp/gate_up", {34816, 5120});
             target.down = bind_projection(prefix + "mlp/down", {5120, 17408});
-            if (!out.dflash.first_generation) {
+            if (has_convolution) {
                 target.attention_conv_base_kernel = bind_dflash(
                     prefix + "attention_conv/base_kernel", {5120, 2, 2});
                 target.attention_conv_kernel_projection = bind_dflash(
@@ -1211,7 +1213,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
             }
         }
         out.dflash.final_norm = bind_dflash("dflash/final_norm", {5120});
-        if (!out.dflash.first_generation) {
+        if (has_selector) {
             out.dflash.selector_hidden_projection =
                 bind_dflash("dflash/candidate_selector/hidden_projection", {256, 5120});
             out.dflash.selector_predecessor_codebook =
@@ -1500,7 +1502,7 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
                 ::ninfer::ops::detail::w8_prepack_qpn_sm70(target.down);
             }
 #endif
-            if (!plan.dflash.first_generation) {
+            if (plan.dflash.has_convolution) {
                 target.attention_conv_base_kernel = artifact::materialized_tensor(
                     backing, source.attention_conv_base_kernel, NumericFormat::BF16, {5120, 2, 2}, device);
                 target.attention_conv_kernel_projection = artifact::materialized_weight(
@@ -1513,7 +1515,7 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
         }
         draft.final_norm = artifact::materialized_tensor(backing, plan.dflash.final_norm,
                                                           NumericFormat::BF16, {5120}, device);
-        if (!plan.dflash.first_generation) {
+        if (plan.dflash.has_selector) {
             draft.selector_hidden_projection = artifact::materialized_weight(
                 backing, plan.dflash.selector_hidden_projection, NumericFormat::BF16, 256, 5120, device);
             draft.selector_predecessor_codebook = artifact::materialized_tensor(

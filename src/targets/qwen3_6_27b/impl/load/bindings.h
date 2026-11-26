@@ -286,6 +286,11 @@ struct DFlashPlan {
     // above that carry them stay empty and the runtime executes the
     // convolution-free, full-attention draft path.
     bool first_generation = false;
+    // What the artifact carried.  The original DFlash has the convolution but
+    // no selector, so the generations are told apart by their presence rather
+    // than by their absence.
+    bool has_convolution = false;
+    bool has_selector = false;
 };
 
 struct BindingPlan {
