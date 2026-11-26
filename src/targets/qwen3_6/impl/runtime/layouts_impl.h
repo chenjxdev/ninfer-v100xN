@@ -201,9 +201,14 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             if constexpr (DFlashConfig::local_layers <= DFlashConfig::layers) {
                 // A paged cache layer owns one K plane and one V plane, so a
                 // cache with one layer per draft layer needs two planes each.
+                // The draft's context cache has its own ceiling: the draft
+                // attends over the tokens produced so far, not over the whole
+                // text context, and the pool is sized for that.
+                const std::uint32_t draft_context = static_cast<std::uint32_t>(
+                    std::min<std::int64_t>(DFlashConfig::context_capacity, plan.capacity));
                 PagedKVPoolSpec full_pool{
-                    .page_group_count      = physical_pages,
-                    .logical_page_capacity = logical_pages,
+                    .page_group_count      = page_count(draft_context),
+                    .logical_page_capacity = page_count(draft_context),
                     .table_rows            = static_cast<std::int32_t>(plan.max_concurrency),
                     .plane_order           = PagedKVPlaneOrder::HeadMajor,
                     .planes = full_context_planes<DFlashConfig>(),
@@ -215,7 +220,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                     // layer.  DFlash2 uses one; the first-generation draft uses
                     // all of them.
                     .layers      = DFlashConfig::layers,
-                    .max_context = plan.capacity,
+                    .max_context = draft_context,
                     .kv_heads    = DFlashConfig::kv_heads,
                     .head_dim    = DFlashConfig::head_dim,
                     .dtype       = DType::BF16,

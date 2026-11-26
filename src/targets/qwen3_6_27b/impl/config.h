@@ -94,6 +94,11 @@ struct DFlashConfig {
     static constexpr float rope_theta      = 1.0e7F;
     static constexpr float attention_scale = 0.08838834764831845F;
     static constexpr std::array<int, feature_layers> target_feature_layers{5, 19, 33, 47, 61};
+    // How many tokens of context the draft keeps.  The first-generation
+    // draft attends over the whole context, so its cache is a paged one
+    // with one layer per draft layer; its own ceiling keeps that
+    // affordable next to the target model on a 16 GB card.
+    static constexpr int context_capacity  = 8192;
 };
 
 struct MMFlashConfig {

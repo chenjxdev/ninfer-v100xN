@@ -82,6 +82,9 @@ struct DFlashConfig {
     static constexpr int query_size        = query_heads * head_dim;
     static constexpr int kv_size           = kv_heads * head_dim;
     static constexpr int local_capacity    = 4096;
+    // How many tokens of context the draft keeps.  This target's draft
+    // follows the text context, as it did before.
+    static constexpr int context_capacity  = 1 << 20;
     static constexpr int mask_token        = 248077;
     static constexpr float rms_epsilon     = 1.0e-6F;
     static constexpr float rope_theta      = 1.0e7F;

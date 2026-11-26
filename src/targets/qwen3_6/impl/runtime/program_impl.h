@@ -101,11 +101,15 @@ schedule::MtpGqaEnvelopes mtp_gqa_envelopes(std::uint32_t max_frontier, std::uin
 }
 
 schedule::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint32_t max_frontier,
-                                           std::uint32_t k) {
+                                           std::uint32_t k, std::uint32_t context_capacity) {
     (void)min_frontier;
+    // The full-context attention reads at most the draft's own context
+    // capacity, so the envelope never names a longer range than the cache
+    // holds.
+    const std::uint32_t full_max = std::min(max_frontier, context_capacity);
     return schedule::DFlashEnvelopes{
         .local  = {0, max_frontier},
-        .full   = {0, max_frontier},
+        .full   = {0, full_max},
         .append = {0, k + 1},
     };
 }
@@ -2293,9 +2297,11 @@ void ProgramImplCore::prepare_graphs() {
         prepare_representative(code_warm.min, 1);
         device.synchronize();
         dflash_state.greedy_target = false;
-        schedule::dflash_decode_batch(dflash_state, 1, draft_window,
-                                      dflash_envelopes(code_warm.min, code_warm.max, draft_window),
-                                      code_warm_target, nullptr);
+        schedule::dflash_decode_batch(
+            dflash_state, 1, draft_window,
+            dflash_envelopes(code_warm.min, code_warm.max, draft_window,
+                             dflash->full ? dflash->full->max_context() : code_warm.max),
+            code_warm_target, nullptr);
         device.synchronize();
 
         // The greedy target-argmax route and the full-logit sampling route are separate CUDA
@@ -2304,9 +2310,11 @@ void ProgramImplCore::prepare_graphs() {
         prepare_representative(code_warm.min, 1);
         device.synchronize();
         dflash_state.greedy_target = true;
-        schedule::dflash_decode_batch(dflash_state, 1, draft_window,
-                                      dflash_envelopes(code_warm.min, code_warm.max, draft_window),
-                                      code_warm_target, nullptr);
+        schedule::dflash_decode_batch(
+            dflash_state, 1, draft_window,
+            dflash_envelopes(code_warm.min, code_warm.max, draft_window,
+                             dflash->full ? dflash->full->max_context() : code_warm.max),
+            code_warm_target, nullptr);
         device.synchronize();
 
         dflash_graphs.profiles.reserve(batch_one_profiles.size() * max_concurrency * 2U);
@@ -2336,8 +2344,9 @@ void ProgramImplCore::prepare_graphs() {
 
                     schedule::capture_dflash_decode_batch(
                         dflash_state, static_cast<std::int32_t>(batch_size), draft_window,
-                        dflash_envelopes(planned.min, planned.max, draft_window), target_envelope,
-                        profile.definition);
+                        dflash_envelopes(planned.min, planned.max, draft_window,
+                                         dflash->full ? dflash->full->max_context() : planned.max),
+                        target_envelope, profile.definition);
                 }
             }
         }
@@ -3411,15 +3420,19 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 return !(requests[lane].sampling_host.temperature > 0.0F);
             });
         DecodeGraphExecutable* executable   = nullptr;
-        schedule::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, draft_window);
+        const std::uint32_t draft_context_capacity =
+            dflash && dflash->full ? dflash->full->max_context() : maximum_frontier;
+        schedule::DFlashEnvelopes envelopes =
+            dflash_envelopes(0, maximum_frontier, draft_window, draft_context_capacity);
         ops::GqaExecutionEnvelope target_envelope{1, maximum_target_tokens};
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(dflash_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "DFlash batch", greedy_target);
             executable      = &install_graph_profile(dflash_graphs, profile, "DFlash batch");
-            envelopes       = dflash_envelopes(profile.min_execution_frontier,
-                                               profile.max_execution_frontier, draft_window);
+            envelopes       = dflash_envelopes(
+                profile.min_execution_frontier, profile.max_execution_frontier, draft_window,
+                draft_context_capacity);
             target_envelope = {
                 1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                        capacity, static_cast<std::uint64_t>(profile.max_execution_frontier) +
