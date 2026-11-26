@@ -167,14 +167,20 @@ def _object_json(obj: ArtifactObject) -> dict[str, object]:
 
 
 def _components_json(plan: V3Plan) -> dict[str, dict[str, object]]:
-    """The components section, with each component's configuration beside its resources."""
+    """The components section, with each component's configuration beside its resources.
+
+    A draft package component states its ``target`` and its ``config`` at the
+    component's own level: the engine reads ``component["target"]`` and
+    ``component["config"]`` directly, so the plan's entries are spread onto
+    the component rather than nested under a single ``config`` key.
+    """
     components: dict[str, dict[str, object]] = {
         name: {"resources": dict(resources)}
         for name, resources in plan.components.items()
     }
-    for name, config in plan.component_configs.items():
+    for name, entries in plan.component_configs.items():
         component = components.setdefault(name, {"resources": {}})
-        component["config"] = config
+        component.update(entries)
     return components
 
 
