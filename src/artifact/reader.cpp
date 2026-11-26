@@ -464,8 +464,10 @@ public:
 
         constexpr std::size_t kStructuralObjects = 1012;
         // The first-generation draft contributes the feature projection, the
-        // context norm, the final norm and eleven objects per draft layer.
-        constexpr std::size_t kMMFlashObjects = 3 + 5 * 11;
+        // context norm, the final norm and eight objects per draft layer: the
+        // packed query/key/value rows, the packed gate/up rows and the six
+        // norms and projections that are not part of those two.
+        constexpr std::size_t kMMFlashObjects = 3 + 5 * 8;
         const std::size_t expected = kStructuralObjects + nvfp4_projections +
                                      (has_dflash2 ? 66 : 0) +
                                      (has_mmflash ? kMMFlashObjects : 0);
