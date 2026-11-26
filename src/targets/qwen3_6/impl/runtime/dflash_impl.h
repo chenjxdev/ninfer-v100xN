@@ -49,6 +49,35 @@ DFlashPersistentState& dflash_state(DFlashBatchContext& state) { return state.df
 
 DFlashPersistentState& dflash_state(DFlashAppendContext& state) { return state.dflash; }
 
+// True when the loaded draft is the first-generation DFlash (MMFlash).
+template <class Model>
+bool dflash_is_first_generation(const Model& model) {
+    return model.dflash.has_value() && model.dflash->first_generation;
+}
+
+// A target that ships the first-generation draft declares MMFlashConfig and with it
+// the target layers that draft reads.  A target without it never produces a
+// first-generation draft, so the empty list is never consulted.
+template <class V>
+std::span<const int> dflash_first_generation_layers() {
+    if constexpr (requires { V::MMFlashConfig::target_feature_layers; }) {
+        return std::span<const int>(V::MMFlashConfig::target_feature_layers);
+    } else {
+        return {};
+    }
+}
+
+// The draft generation selects which target layers the draft reads.  DFlash2 taps
+// [5, 19, 33, 47, 61]; the first-generation draft (MMFlash) taps [1, 16, 31, 46, 61].
+template <class Config>
+std::span<const int> dflash_feature_layers(bool first_generation,
+                                           std::span<const int> first_generation_layers) {
+    if (first_generation) {
+        return first_generation_layers;
+    }
+    return std::span<const int>(Config::target_feature_layers);
+}
+
 template <class V>
 DFlashFeatureSink prefill_feature_sink_impl(PrefillContext& state,
                                             DFlashFeatureSink::PrefillConsumer consume_prefill) {
@@ -60,7 +89,9 @@ DFlashFeatureSink prefill_feature_sink_impl(PrefillContext& state,
         return DFlashFeatureSink{
             .features        = &dflash_state(state).prefill_features,
             .positions       = &dflash_state(state).prefill_positions,
-            .layers          = std::span<const int>(Config::target_feature_layers),
+            .layers          = dflash_feature_layers<Config>(
+                dflash_is_first_generation(state.execution.model),
+                dflash_first_generation_layers<V>()),
             .consume_prefill = std::move(consume_prefill),
         };
     }
@@ -80,7 +111,9 @@ DFlashFeatureSink batch_feature_sink_impl(DFlashBatchContext& state, const Tenso
             .batch_valid_columns = &valid_columns,
             .batch_width         = width,
             .batch_size          = batch_size,
-            .layers              = std::span<const int>(Config::target_feature_layers),
+            .layers              = dflash_feature_layers<Config>(
+                dflash_is_first_generation(state.execution.model),
+                dflash_first_generation_layers<V>()),
         };
     }
 }
@@ -195,6 +228,9 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
         using Config               = typename V::DFlashConfig;
         const std::int32_t width   = static_cast<std::int32_t>(k) + 1;
         const std::int32_t columns = width * batch_size;
+        // The first-generation draft (MMFlash) has no convolution, no candidate
+        // selector and a full rather than sliding attention window.
+        const bool first_generation = state.execution.model.dflash->first_generation;
         Tensor anchors             = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers           = frame.execution_frontiers.slice(0, 0, batch_size);
         Tensor valid_columns       = frame.target_valid_columns.slice(0, 0, batch_size);
@@ -220,10 +256,15 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                     workspace_recipe::dflash_attention<Config>(state.execution.work, columns);
                 ops::rmsnorm(residual, weight.input_norm, Config::rms_epsilon, false, roots.hidden,
                              state.execution.device.stream);
-                ops::linear(roots.hidden, weight.attention_conv_kernel_projection, roots.conv_dynamic,
-                            state.execution.device.stream);
-                ops::dflash2_conv(roots.hidden, roots.conv_dynamic, weight.attention_conv_base_kernel, 0,
-                                  roots.conv_input, state.execution.device.stream);
+                // The first-generation draft has no dynamic grouped convolution: its
+                // attention reads the block state directly.
+                if (!first_generation) {
+                    ops::linear(roots.hidden, weight.attention_conv_kernel_projection,
+                                roots.conv_dynamic, state.execution.device.stream);
+                    ops::dflash2_conv(roots.hidden, roots.conv_dynamic,
+                                      weight.attention_conv_base_kernel, 0, roots.conv_input,
+                                      state.execution.device.stream);
+                }
                 Tensor query_raw =
                     roots.query_raw.view({Config::head_dim, Config::query_heads, columns});
                 Tensor key_raw = roots.key_raw.view({Config::head_dim, Config::kv_heads, columns});
@@ -231,10 +272,11 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 Tensor query_flat = query_raw.view({Config::query_size, columns});
                 Tensor key_flat   = key_raw.view({Config::kv_size, columns});
                 Tensor value_flat = value.view({Config::kv_size, columns});
-                ops::linear(roots.conv_input, weight.query, query_flat, ops::LinearPolicy::A16Only,
+                Tensor attention_input = first_generation ? roots.hidden : roots.conv_input;
+                ops::linear(attention_input, weight.query, query_flat, ops::LinearPolicy::A16Only,
                             state.execution.work, state.execution.device.stream);
-                ops::linear(roots.conv_input, weight.key, key_flat, state.execution.device.stream);
-                ops::linear(roots.conv_input, weight.value, value_flat, state.execution.device.stream);
+                ops::linear(attention_input, weight.key, key_flat, state.execution.device.stream);
+                ops::linear(attention_input, weight.value, value_flat, state.execution.device.stream);
                 Tensor query = roots.query.view({Config::head_dim, Config::query_heads, columns});
                 Tensor key   = roots.key.view({Config::head_dim, Config::kv_heads, columns});
                 ops::rmsnorm(query_raw, weight.query_norm, Config::rms_epsilon, false, query,
@@ -251,7 +293,15 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                     value.view({Config::head_dim, Config::kv_heads, width, batch_size});
                 Tensor attention_batch = roots.attention.view(
                     {Config::head_dim, Config::query_heads, width, batch_size});
-                if (layer < Config::local_layers) {
+                if (first_generation) {
+                    // The first-generation draft attends over the whole context and
+                    // over every row of the block; it has no sliding window.
+                    ops::bidirectional_gqa_attention(
+                        query_batch, key_batch, value_batch, frontiers, valid_columns, full_rows,
+                        Config::attention_scale, dflash_state(state).full_batch_layer(0),
+                        envelopes.full, state.execution.work, attention_batch,
+                        state.execution.device.stream);
+                } else if (layer < Config::local_layers) {
                     ops::swa(query_batch, key_batch, value_batch, positions, valid_columns, lanes,
                              Config::attention_scale,
                              dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
@@ -267,32 +317,41 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 ops::linear(roots.attention.view({Config::query_size, columns}),
                             weight.attention_output, roots.attention_projected,
                             ops::LinearPolicy::A16Only, state.execution.work, state.execution.device.stream);
-                ops::dflash2_conv(roots.attention_projected, roots.conv_dynamic,
-                                  weight.attention_conv_base_kernel, 1, roots.attention_convolved,
-                                  state.execution.device.stream);
-                ops::residual_add(roots.attention_convolved, residual, state.execution.device.stream);
+                if (!first_generation) {
+                    ops::dflash2_conv(roots.attention_projected, roots.conv_dynamic,
+                                      weight.attention_conv_base_kernel, 1,
+                                      roots.attention_convolved, state.execution.device.stream);
+                }
+                ops::residual_add(first_generation ? roots.attention_projected
+                                                   : roots.attention_convolved,
+                                  residual, state.execution.device.stream);
             }
             {
                 auto mlp_scope = state.execution.work.scope();
                 auto roots = workspace_recipe::dflash_mlp<Config>(state.execution.work, columns);
                 ops::rmsnorm(residual, weight.post_attention_norm, Config::rms_epsilon, false,
                              roots.hidden, state.execution.device.stream);
-                ops::linear(roots.hidden, weight.mlp_conv_kernel_projection, roots.dynamic,
-                            state.execution.device.stream);
-                ops::dflash2_conv(roots.hidden, roots.dynamic, weight.mlp_conv_base_kernel, 0,
-                                  roots.input, state.execution.device.stream);
+                if (!first_generation) {
+                    ops::linear(roots.hidden, weight.mlp_conv_kernel_projection, roots.dynamic,
+                                state.execution.device.stream);
+                    ops::dflash2_conv(roots.hidden, roots.dynamic, weight.mlp_conv_base_kernel, 0,
+                                      roots.input, state.execution.device.stream);
+                }
                 Tensor gate_up = state.execution.work.alloc(
                     DType::BF16, {2 * Config::intermediate, columns});
-                ops::linear(roots.input, weight.gate_up, gate_up, ops::LinearPolicy::A16Only,
-                            state.execution.work, state.execution.device.stream);
+                ops::linear(first_generation ? roots.hidden : roots.input, weight.gate_up, gate_up,
+                            ops::LinearPolicy::A16Only, state.execution.work, state.execution.device.stream);
                 ops::silu_mul(gate_up.slice(0, 0, Config::intermediate),
                               gate_up.slice(0, Config::intermediate, Config::intermediate),
                               roots.intermediate, state.execution.device.stream);
                 ops::linear(roots.intermediate, weight.down, roots.projected,
                             ops::LinearPolicy::A16Only, state.execution.work, state.execution.device.stream);
-                ops::dflash2_conv(roots.projected, roots.dynamic, weight.mlp_conv_base_kernel, 1,
-                                  roots.convolved, state.execution.device.stream);
-                ops::residual_add(roots.convolved, residual, state.execution.device.stream);
+                if (!first_generation) {
+                    ops::dflash2_conv(roots.projected, roots.dynamic, weight.mlp_conv_base_kernel, 1,
+                                      roots.convolved, state.execution.device.stream);
+                }
+                ops::residual_add(first_generation ? roots.projected : roots.convolved,
+                                  residual, state.execution.device.stream);
             }
         }
 
@@ -316,6 +375,67 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
         // full-vocabulary candidate set while avoiding a full-vocabulary peer transfer: each rank
         // produces its local top-16 ordered keys and rank 0 merges the two 16-entry lists.
         const std::int32_t selector_columns = static_cast<std::int32_t>(k) * batch_size;
+        if (first_generation) {
+            // The first-generation draft proposes its tokens with a plain argmax over
+            // the target model's output head, exactly as the reference implementation
+            // does.  The output head is row-split across the TP ranks, so each rank
+            // takes the argmax of its own vocabulary shard and the winners are merged
+            // by score.
+            const std::int32_t shard_rows = TextConfig::output_rows / 2;
+            if (state.execution.peers.empty()) {
+                Tensor logits = state.execution.work.alloc(
+                    DType::BF16, {TextConfig::output_rows, selector_columns});
+                ops::linear(proposal_hidden, state.execution.model.output_head, logits,
+                            ops::LinearPolicy::A16Only, state.execution.work,
+                            state.execution.device.stream);
+                Tensor values = state.execution.work.alloc(DType::FP32, {1, selector_columns});
+                Tensor indices = state.execution.work.alloc(DType::I32, {1, selector_columns});
+                ops::argmax_with_value(logits, values, indices, TextConfig::output_rows,
+                                        state.execution.device.stream);
+                Tensor gathered_values = state.execution.work.alloc(DType::FP32, {1, selector_columns});
+                Tensor gathered_indices = state.execution.work.alloc(DType::I32, {1, selector_columns});
+                Tensor draft_tokens = drafts.view({selector_columns});
+                ops::merge_argmax_shards(values, indices, draft_tokens, 0,
+                                          state.execution.device.stream);
+                state.execution.work.reset();
+                return;
+            }
+            Tensor peer_hidden = state.execution.peers[0].work->alloc(DType::BF16,
+                                                                      {Config::hidden, selector_columns});
+            ops::broadcast_rank0(proposal_hidden, std::span<const Tensor>(&peer_hidden, 1),
+                                 *state.execution.peers[0].execution,
+                                 *state.execution.peers[0].events);
+            Tensor part0 = state.execution.work.alloc(DType::BF16, {shard_rows, selector_columns});
+            Tensor part1 = state.execution.peers[0].work->alloc(DType::BF16,
+                                                                {shard_rows, selector_columns});
+            ops::linear_column_parallel(
+                std::array<Tensor, 2>{proposal_hidden, peer_hidden},
+                std::array<Weight, 2>{state.execution.model.output_head,
+                                      state.execution.peers[0].model->output_head},
+                std::array<Tensor, 2>{part0, part1}, *state.execution.peers[0].execution);
+            Tensor values0 = state.execution.work.alloc(DType::FP32, {1, selector_columns});
+            Tensor indices0 = state.execution.work.alloc(DType::I32, {1, selector_columns});
+            ops::argmax_with_value(part0, values0, indices0, shard_rows,
+                                    state.execution.device.stream);
+            Tensor values1 = state.execution.peers[0].work->alloc(DType::FP32, {1, selector_columns});
+            Tensor indices1 = state.execution.peers[0].work->alloc(DType::I32, {1, selector_columns});
+            {
+                const CurrentDevice restore;
+                CUDA_CHECK(cudaSetDevice(state.execution.peers[0].device->device));
+                ops::argmax_with_value(part1, values1, indices1, shard_rows,
+                                        state.execution.peers[0].device->stream);
+            }
+            Tensor gathered_values = state.execution.work.alloc(DType::FP32, {2, selector_columns});
+            Tensor gathered_indices = state.execution.work.alloc(DType::I32, {2, selector_columns});
+            ops::allreduce_argmax(
+                std::array<Tensor, 2>{values0, values1},
+                std::array<Tensor, 2>{indices0, indices1},
+                std::array<Tensor, 1>{drafts.view({selector_columns})}, gathered_values,
+                gathered_indices, shard_rows, *state.execution.peers[0].execution,
+                *state.execution.peers[0].events);
+            state.execution.work.reset();
+            return;
+        }
         const std::int32_t shard   = TextConfig::output_rows / 2;
         if (state.execution.peers.empty()) {
             Tensor logits = state.execution.work.alloc(

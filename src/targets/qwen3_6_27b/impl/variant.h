@@ -21,6 +21,7 @@ struct Variant {
     using TextConfig                     = detail::TextConfig;
     using VisionConfig                   = detail::VisionConfig;
     using DFlashConfig                   = detail::DFlashConfig;
+    using MMFlashConfig                  = detail::MMFlashConfig;
     using ModelView                      = detail::RuntimeModelView;
     using FullAttentionProjectionWeights = detail::FullAttentionProjectionPayload;
     using GdnProjectionWeights           = detail::GdnProjectionPayload;

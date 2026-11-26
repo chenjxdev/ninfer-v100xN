@@ -96,11 +96,41 @@ struct DFlashConfig {
     static constexpr std::array<int, feature_layers> target_feature_layers{5, 19, 33, 47, 61};
 };
 
+struct MMFlashConfig {
+    // Qwen3.8-27B-MMFlash: the first-generation DFlash draft.  Five full-attention
+    // draft blocks fed by the target-layer feature taps [1, 16, 31, 46, 61].  Unlike
+    // DFlash2 the draft has no dynamic grouped convolution and no candidate selector:
+    // it proposes its tokens with an argmax over the target model's own output head.
+    // The execution skeleton is shared with the DFlash backend; only the draft's own
+    // attention and token selection differ.
+    static constexpr bool supported        = true;
+    static constexpr int layers            = 5;
+    static constexpr int local_layers      = 5;
+    static constexpr int feature_layers    = 5;
+    static constexpr int feature_rows      = feature_layers * TextConfig::hidden;
+    static constexpr int hidden            = TextConfig::hidden;
+    static constexpr int intermediate      = TextConfig::intermediate;
+    static constexpr int query_heads       = 32;
+    static constexpr int kv_heads          = 8;
+    static constexpr int head_dim          = 128;
+    static constexpr int query_size        = query_heads * head_dim;
+    static constexpr int kv_size           = kv_heads * head_dim;
+    static constexpr int local_capacity    = 2048;
+    static constexpr int mask_token        = 248070;
+    static constexpr int block_size        = 16;
+    static constexpr float rms_epsilon     = 1.0e-6F;
+    static constexpr float rope_theta      = 1.0e7F;
+    static constexpr float attention_scale = 0.08838834764831845F;
+    static constexpr std::array<int, feature_layers> target_feature_layers{1, 16, 31, 46, 61};
+};
+
 inline constexpr float kAttentionScale                   = 0.0625F;
 inline constexpr float kGdnScale                         = 0.08838834764831845F;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 7;
+// MMFlash proposes a full 16-token block; the DFlash2 path stays at seven.
+inline constexpr std::uint32_t kMaximumMMFlashDraftTokens = 15;
 inline constexpr std::uint32_t kNativeContext            = 262144;
 
 } // namespace ninfer::targets::qwen3_6_27b::detail

@@ -86,6 +86,12 @@ struct DFlashWeights {
     Weight selector_hidden_projection;
     Tensor selector_predecessor_codebook;
     Tensor selector_successor_codebook;
+    // True for the first-generation DFlash draft (MMFlash).  That draft has no
+    // dynamic grouped convolution and no candidate selector, attends over the
+    // full context instead of a sliding window, and picks its tokens with an
+    // argmax over the target's output head.  The weights above are laid out the
+    // same way for both generations, so only the execution differs.
+    bool first_generation = false;
 };
 
 template <class FullProjectionPayload, class GdnProjectionPayload, class MainPostMixerPayload,

@@ -281,6 +281,11 @@ struct DFlashPlan {
     artifact::ObjectHandle selector_hidden_projection;
     artifact::ObjectHandle selector_predecessor_codebook;
     artifact::ObjectHandle selector_successor_codebook;
+    // True for the first-generation DFlash draft (MMFlash).  That draft has no
+    // dynamic grouped convolution and no candidate selector, so the objects
+    // above that carry them stay empty and the runtime executes the
+    // convolution-free, full-attention draft path.
+    bool first_generation = false;
 };
 
 struct BindingPlan {
