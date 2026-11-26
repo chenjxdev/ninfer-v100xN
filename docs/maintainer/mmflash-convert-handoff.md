@@ -180,6 +180,9 @@ EOF
 - `components` 含 `mmflash`，其 `config` 的目标层是 `[1, 16, 31, 46, 61]`，
   `layer_types` 是 5 个 `full_attention`，`block_size` 是 16
 - `dflash/` 开头的对象恰好 43 个
+- **对象总数是 1259**。这个数字是 reader 的硬校验：
+  1012 个结构性对象 + 204 个 NVFP4 投影 + 43 个 MMFlash 草稿对象。
+  差一个都会在引擎加载时被拒（"projection produced N objects; expected 1259"）。
 
 3) 转换报告：
 
@@ -188,6 +191,22 @@ $PY -c "import json;d=json.load(open('$OUT.conversion.json'));print(d['arguments
 ```
 
 `mmflash_source` 应该指向 `<MMFLASH_DIR>`。
+
+4) 用引擎实际加载一次（最直接的验证）：
+
+```bash
+$W/build-v100/apps/ninfer-serve "$OUT" \
+    --host 127.0.0.1 --port 18099 --tp 2 --devices 1,0 \
+    --max-context 4096 --kv-dtype int8 \
+    --spec dflash --draft-tokens 15
+```
+
+能打印出 `model loaded` 并开始监听，就说明 v3 目录、对象计数、bindings 和
+`components/mmflash` 的校验全部通过了。这一步需要两个 GPU 和约 16 GB 显存。
+
+（`--spec dflash --draft-tokens 15` 是 MMFlash 的块宽：16 宽块减掉锚点 token。
+如果报 "DFlash draft window must be in [1,7]" 之类，说明加载的是旧引擎，
+需要用本分支编译的二进制。）
 
 ## 已知约束
 
