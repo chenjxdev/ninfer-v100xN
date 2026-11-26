@@ -175,9 +175,15 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 builder, DFlashConfig::local_layers, DFlashConfig::local_capacity,
                 DFlashConfig::kv_heads, DFlashConfig::head_dim,
                 static_cast<std::int32_t>(plan.max_concurrency));
-            if constexpr (DFlashConfig::local_layers < DFlashConfig::layers) {
-                static_assert(DFlashConfig::local_layers <= DFlashConfig::layers &&
-                              DFlashConfig::layers - DFlashConfig::local_layers <= 1);
+            // The first-generation draft (MMFlash) attends over the whole context
+            // instead of a sliding window, so it needs the paged full-context
+            // cache.  The 27B target used to plan that cache only when the
+            // sliding-window draft had fewer layers than the draft has blocks;
+            // with every layer sliding, the cache was never planned and a
+            // full-attention draft had nowhere to keep its context.  The cache
+            // is planned for every DFlash draft now and the draft generation
+            // picks which of the two it uses.
+            if constexpr (DFlashConfig::local_layers <= DFlashConfig::layers) {
                 PagedKVPoolSpec full_pool{
                     .page_group_count      = physical_pages,
                     .logical_page_capacity = logical_pages,

@@ -62,6 +62,14 @@ class SourceProfile:
     #: NVFP4 too, so an 8-bit head stores four bits of redundancy per weight.
     embedding_format: str = "Q6G64_F16S"
     output_head_format: str = "W8G32_F16S"
+    #: The container version the converter writes.
+    #:
+    #: ``v2`` is the flat directory of identity plus objects.  ``v3`` adds the
+    #: logical-parameter bindings, the activation input divisor of every NVFP4
+    #: projection and the per-component resources, which is what lets a
+    #: container carry a draft package such as the first-generation DFlash
+    #: draft (MMFlash) with its own configuration.
+    container_version: str = "v2"
 
     @property
     def mtp_auxiliary_fields(self) -> tuple[str, ...]:

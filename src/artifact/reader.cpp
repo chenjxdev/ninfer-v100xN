@@ -456,10 +456,19 @@ public:
 
         const bool has_dflash2 = directory_.at("components").contains("dflash2");
         if (has_dflash2) { add_dflash2(); }
+        const bool has_mmflash = directory_.at("components").contains("mmflash");
+        if (has_mmflash) { add_mmflash(); }
+        if (has_dflash2 && has_mmflash) {
+            throw ArtifactError("qwen3.8-27b v3 carries more than one DFlash draft");
+        }
 
         constexpr std::size_t kStructuralObjects = 1012;
+        // The first-generation draft contributes the feature projection, the
+        // context norm, the final norm and eleven objects per draft layer.
+        constexpr std::size_t kMMFlashObjects = 3 + 5 * 11;
         const std::size_t expected = kStructuralObjects + nvfp4_projections +
-                                     (has_dflash2 ? 66 : 0);
+                                     (has_dflash2 ? 66 : 0) +
+                                     (has_mmflash ? kMMFlashObjects : 0);
         if (selected_.size() != expected) {
             throw ArtifactError("qwen3.8-27b v3 projection produced " +
                                 std::to_string(selected_.size()) + " objects; expected " +
@@ -538,6 +547,43 @@ public:
     }
 
 private:
+    void add_mmflash() {
+        const auto& component = directory_.at("components").at("mmflash");
+        const auto& config = component.at("config");
+        const auto& draft = config.at("dflash_config");
+        if (component.at("target") != "text" ||
+            config.at("num_hidden_layers") != 5 || config.at("intermediate_size") != 17408 ||
+            config.at("num_attention_heads") != 32 || config.at("num_key_value_heads") != 8 ||
+            config.at("head_dim") != 128 || !config.at("sliding_window").is_null() ||
+            config.at("layer_types") != Json::array({"full_attention", "full_attention",
+                "full_attention", "full_attention", "full_attention"}) ||
+            config.at("rope_parameters").at("rope_theta") != 10000000.0 ||
+            std::abs(config.at("rms_norm_eps").get<double>() - 1e-6) > 1e-13 ||
+            config.at("block_size") != 16 ||
+            draft.at("target_layer_ids") != Json::array({1, 16, 31, 46, 61}) ||
+            draft.at("mask_token_id") != 248070) {
+            throw ArtifactError("unsupported qwen3.8-27b v3 MMFlash configuration");
+        }
+        for (const char* role : {"feature_projection", "context_norm", "final_norm"}) {
+            add("dflash/" + std::string(role), {"dflash/" + std::string(role)});
+        }
+        for (int layer = 0; layer < 5; ++layer) {
+            const std::string prefix = "dflash/layers/" + std::to_string(layer) + "/";
+            // The draft's attention reads the block state and the context
+            // together, so the query, key and value rows are one packed
+            // matrix that the runtime splits back into row views.
+            add(prefix + "attention/query_key_value",
+                {prefix + "attention/query", prefix + "attention/key",
+                 prefix + "attention/value"});
+            add(prefix + "mlp/gate_up", {prefix + "mlp/gate", prefix + "mlp/up"});
+            for (const char* role : {"input_norm", "post_attention_norm",
+                    "attention/query_norm", "attention/key_norm", "attention/output",
+                    "mlp/down"}) {
+                add(prefix + role, {prefix + role});
+            }
+        }
+    }
+
     void add_dflash2() {
         const auto& component = directory_.at("components").at("dflash2");
         const auto& config = component.at("config");

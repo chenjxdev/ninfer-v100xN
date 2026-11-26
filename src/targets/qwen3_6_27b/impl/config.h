@@ -128,9 +128,15 @@ inline constexpr float kAttentionScale                   = 0.0625F;
 inline constexpr float kGdnScale                         = 0.08838834764831845F;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
-inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 7;
-// MMFlash proposes a full 16-token block; the DFlash2 path stays at seven.
-inline constexpr std::uint32_t kMaximumMMFlashDraftTokens = 15;
+// The DFlash2 package proposes a block of eight, i.e. seven drafts, and the
+// first-generation draft (MMFlash) a block of sixteen, i.e. fifteen.  The
+// ceiling is the family limit; each generation checks its own width against
+// the draft it actually loaded.
+inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;
+// The DFlash2 package's own width: a block of eight minus the anchor token.
+inline constexpr std::uint32_t kDFlash2DraftTokens = 7;
+// The first-generation draft's width: a block of sixteen minus the anchor token.
+inline constexpr std::uint32_t kMMFlashDraftTokens = 15;
 inline constexpr std::uint32_t kNativeContext            = 262144;
 
 } // namespace ninfer::targets::qwen3_6_27b::detail

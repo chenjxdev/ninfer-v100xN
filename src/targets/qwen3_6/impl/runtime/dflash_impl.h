@@ -137,7 +137,9 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
             table_rows.ne[0] != batch) {
             throw std::invalid_argument("DFlash context append inputs are invalid");
         }
-        const bool replace_local_window = batch == 1 && width > Config::local_capacity;
+        const bool replace_local_window =
+            !dflash_is_first_generation(state.execution.model) && batch == 1 &&
+            width > Config::local_capacity;
         if (replace_local_window && (envelope.min_count != static_cast<std::uint32_t>(width) ||
                                      envelope.max_count != static_cast<std::uint32_t>(width))) {
             throw std::invalid_argument(
@@ -171,11 +173,16 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
         ops::rmsnorm(projected, state.execution.model.dflash->context_norm, Config::rms_epsilon,
                      false, context, state.execution.device.stream);
 
+        // The first-generation draft attends over the whole context, so every
+        // one of its layers writes into the paged full-context cache.  The
+        // sliding-window draft keeps the 2048-token window in the cyclic local
+        // cache instead.
+        const bool first_generation = dflash_is_first_generation(state.execution.model);
         for (int layer = 0; layer < Config::layers; ++layer) {
             auto layer_scope = state.execution.work.scope();
             const auto& weight =
                 state.execution.model.dflash->layers.at(static_cast<std::size_t>(layer));
-            const bool local_layer  = layer < Config::local_layers;
+            const bool local_layer  = !first_generation && layer < Config::local_layers;
             const int layer_width   = local_layer ? local_width : width;
             const int layer_columns = layer_width * batch;
             Tensor layer_context    = local_layer && replace_local_window

@@ -49,6 +49,7 @@ from tools.artifact.container import (
     ArtifactObject,
     ArtifactWriter,
 )
+from tools.artifact.container_v3 import V3ArtifactWriter
 from tools.artifact.layouts import (
     encode_direct,
     encode_fp8_row_scaled,
@@ -61,6 +62,8 @@ from tools.convert.qwen3_6_27b import convert as family_config
 from tools.convert.qwen3_6_27b import draft_head
 
 from . import inventory_nvfp4 as inventory
+from . import mmflash
+from . import v3_plan
 from . import recipe_nvfp4 as recipe
 from . import source_profile
 
@@ -498,12 +501,30 @@ def _build_report(
     return report
 
 
+def _make_writer(output: Path, specs):
+    """The artifact writer the source profile asks for.
+
+    The v3 container carries the logical-parameter bindings, the activation
+    input divisor of every NVFP4 projection and the per-component resources.
+    That is what lets the container hold a draft package, such as the
+    first-generation DFlash draft (MMFlash), with the configuration the
+    engine validates it against.
+    """
+    identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID)
+    if source_profile.ACTIVE.container_version == "v3":
+        return V3ArtifactWriter(
+            output, identity, specs, v3_plan.build_plan(specs)
+        )
+    return ArtifactWriter(output, identity, specs)
+
+
 def convert(
     quantized_dir: str | Path,
     out_path: str | Path,
     *,
     device: str | torch.device = "cuda",
     auxiliary_dir: str | Path = AUXILIARY_MTP_REPOSITORY,
+    mmflash_model: str | Path | None = None,
 ) -> Path:
     """Run the closed single-source conversion and return its report path."""
 
@@ -536,14 +557,17 @@ def convert(
     resources = {resource.name: resource.data for resource in preflight.resources}
     draft_ids = draft_head.materialize_draft_head_token_ids(preflight.draft)
     derived = {draft_head.DRAFT_HEAD_TOKEN_IDS_OBJECT: draft_ids}
+    # The first-generation DFlash draft (MMFlash) ships as its own
+    # checkpoint, so its objects are built from that checkpoint rather than
+    # from the target's source.
+    mmflash_payloads: dict[str, bytes] = {}
+    if mmflash_model is not None:
+        for obj in mmflash.build_mmflash_objects(mmflash_model, device=resolved_device):
+            mmflash_payloads[obj.name] = obj.payload
     with QadSourceReader(
         preflight.quantized_dir, auxiliary_dir
     ) as quantized_reader:
-        with ArtifactWriter(
-            output,
-            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
-            preflight.object_plan.specs,
-        ) as writer:
+        with _make_writer(output, preflight.object_plan.specs) as writer:
             if writer.objects != preflight.object_plan.objects:
                 raise RuntimeError(
                     "writer object plan differs from completed preflight"
@@ -552,6 +576,8 @@ def convert(
                 payload: bytes | Iterable[bytes]
                 if isinstance(spec, inventory.ResourceSpec):
                     payload = resources[spec.name]
+                elif spec.name in mmflash_payloads:
+                    payload = mmflash_payloads[spec.name]
                 elif spec.name in recipe.NVFP4_WEIGHTS_BY_NAME:
                     payload = _encode_nvfp4_weight(spec, quantized_reader)
                 elif spec.name in recipe.FP8_WEIGHTS_BY_NAME:
@@ -591,6 +617,7 @@ def convert(
         "out": str(out_path),
         "device": requested_device,
         "mtp_source": str(auxiliary_dir) if auxiliary_dir else None,
+        "mmflash_source": str(mmflash_model) if mmflash_model else None,
     }
     report = _build_report(
         preflight=preflight,
@@ -632,6 +659,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         default=AUXILIARY_MTP_REPOSITORY,
         help="auxiliary checkpoint providing the four MTP tensors QAD omits",
     )
+    parser.add_argument(
+        "--mmflash-model",
+        default=None,
+        type=Path,
+        help=(
+            "checkpoint providing the first-generation DFlash draft (MMFlash); "
+            "without it the artifact carries no draft package"
+        ),
+    )
     arguments = parser.parse_args(argv)
     if arguments.source != source_profile.ACTIVE.name:
         raise SystemExit(
@@ -645,6 +681,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         arguments.out,
         device=arguments.device,
         auxiliary_dir=arguments.mtp_source,
+        mmflash_model=arguments.mmflash_model,
     )
 
 

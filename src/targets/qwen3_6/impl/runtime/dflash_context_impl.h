@@ -12,7 +12,9 @@ DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
       prefill_positions(layout.prefill_positions.bind(backing)),
       pending_features(layout.pending_features.bind(backing)) {
     if (layout.full) { full.emplace(backing, *layout.full); }
-    if (full.has_value() != (DFlashConfig::local_layers < DFlashConfig::layers) ||
+    // The full-context cache is planned for every DFlash draft now; the draft
+    // generation decides whether it reads the sliding-window cache or this one.
+    if (!full.has_value() ||
         local.layer_count() != DFlashConfig::local_layers ||
         rewrite_checkpoint_local.layer_count() != DFlashConfig::local_layers ||
         local.capacity() != DFlashConfig::local_capacity ||
