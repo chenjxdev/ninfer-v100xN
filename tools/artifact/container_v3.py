@@ -48,10 +48,14 @@ MAGIC_V3 = b"NINFER\x00\x03"
 V3_HEADER_BYTES = 32
 PAYLOAD_ALIGNMENT = 4096
 
-#: The container identity the engine registers the published QUASAR artifact
-#: by (reader.cpp compares these sixteen bytes at offset 16).
+#: The engine reads the sixteen bytes at offset 16 as the container identity
+#: and nothing else: a v3 container that carries this exact value is bound as
+#: the QUASAR weights profile (every projection NVFP4, both vocabulary
+#: endpoints W8), any other value as the mixed ``nvfp4`` profile. The identity
+#: therefore has to follow the artifact's format map -- a mixed map labelled
+#: QUASAR is rejected at the vocabulary endpoints.
 QUASAR_ID = bytes.fromhex("39be2299c2b94512abd51ffe079830f2")
-#: The identity of a container that is not the published QUASAR one.
+#: The identity of a container bound as the mixed ``nvfp4`` weights profile.
 NEUTRAL_ID = bytes(16)
 
 #: The v3 spelling of the v2 numeric formats and layouts.
@@ -167,16 +171,17 @@ def _object_json(obj: ArtifactObject) -> dict[str, object]:
 
 
 def _components_json(plan: V3Plan) -> dict[str, dict[str, object]]:
-    """The components section, with each component's configuration beside its resources.
+    """The components section: each component's resources, and its draft configuration.
 
-    A draft package component states its ``target`` and its ``config`` at the
-    component's own level: the engine reads ``component["target"]`` and
-    ``component["config"]`` directly, so the plan's entries are spread onto
-    the component rather than nested under a single ``config`` key.
+    ``plan.components`` already maps a component name to the component's own
+    body -- ``{"resources": {role: object id}}`` -- so the bodies are copied
+    as they are; the engine reads ``component["resources"][role]``. A draft
+    package component states its ``target`` and its ``config`` at the same
+    level, so the plan's entries are spread onto the component rather than
+    nested under a single ``config`` key.
     """
     components: dict[str, dict[str, object]] = {
-        name: {"resources": dict(resources)}
-        for name, resources in plan.components.items()
+        name: dict(body) for name, body in plan.components.items()
     }
     for name, entries in plan.component_configs.items():
         component = components.setdefault(name, {"resources": {}})
@@ -221,7 +226,7 @@ class V3ArtifactWriter:
         identity: ArtifactIdentity,
         specs: Sequence[ObjectSpec],
         plan: V3Plan,
-        fingerprint: bytes = QUASAR_ID,
+        fingerprint: bytes = NEUTRAL_ID,
     ) -> None:
         self.path = Path(path)
         self.identity = identity

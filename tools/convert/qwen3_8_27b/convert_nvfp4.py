@@ -49,7 +49,7 @@ from tools.artifact.container import (
     ArtifactObject,
     ArtifactWriter,
 )
-from tools.artifact.container_v3 import V3ArtifactWriter
+from tools.artifact.container_v3 import NEUTRAL_ID, QUASAR_ID, V3ArtifactWriter
 from tools.artifact.layouts import (
     encode_direct,
     encode_fp8_row_scaled,
@@ -438,15 +438,24 @@ def _make_writer(output: Path, specs):
 
     The v3 container carries the logical-parameter bindings, the activation
     input divisor of every NVFP4 projection and the frontend resources; the
-    engine's QUASAR adapter reads them from there.
+    engine's v3 adapter reads them from there.
+
+    A v3 container is bound by the sixteen-byte identity at its offset 16:
+    the QUASAR value selects the full-NVFP4 weights profile (both vocabulary
+    endpoints W8), anything else the mixed ``nvfp4`` profile. The identity
+    therefore follows the profile's ``weights_id`` -- a mixed format map
+    labelled QUASAR is rejected at the vocabulary endpoints.
     """
 
     identity = ArtifactIdentity(
         inventory.MODEL_ID, source_profile.ACTIVE.weights_id
     )
     if source_profile.ACTIVE.container_version == "v3":
+        fingerprint = (
+            QUASAR_ID if identity.weights_id == "quasar-nvfp4" else NEUTRAL_ID
+        )
         return V3ArtifactWriter(
-            output, identity, specs, v3_plan.build_plan(specs)
+            output, identity, specs, v3_plan.build_plan(specs), fingerprint
         )
     return ArtifactWriter(output, identity, specs)
 
