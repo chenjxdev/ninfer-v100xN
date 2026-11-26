@@ -28,10 +28,52 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <cstdlib>
+#include <fstream>
 #include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
+
+// The first-generation draft's trace, enabled with NINFER_MMFLASH_TRACE.
+//
+// The draft's correctness is hard to judge from the acceptance rate alone: a
+// wrong draft looks exactly like a rejected one.  The trace writes the draft's
+// inputs and outputs so that they can be compared against the reference
+// implementation.
+struct MMFlashTrace {
+    [[nodiscard]] static bool enabled() {
+        static const bool on = std::getenv("NINFER_MMFLASH_TRACE") != nullptr;
+        return on;
+    }
+
+    static void write(const std::string& name, const Tensor& tensor, cudaStream_t stream);
+};
+
+void MMFlashTrace::write(const std::string& name, const Tensor& tensor, cudaStream_t stream) {
+    if (!enabled()) { return; }
+    const char* root = std::getenv("NINFER_MMFLASH_TRACE");
+    if (root == nullptr) { return; }
+    const std::string path = std::string(root) + "." + name + ".bin";
+    const std::size_t size = tensor.bytes();
+    if (size == 0) { return; }
+    std::vector<std::byte> host(size);
+    CUDA_CHECK(cudaMemcpyAsync(host.data(), tensor.data, size, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::ofstream out(path, std::ios::binary);
+    if (!out) { return; }
+    const std::int64_t elements = tensor.numel();
+    const std::int32_t shape[4] = {tensor.ne[0], tensor.ne[1], tensor.ne[2], tensor.ne[3]};
+    const std::uint32_t dtype = static_cast<std::uint32_t>(tensor.dtype);
+    out.write(reinterpret_cast<const char*>(&elements), sizeof(elements));
+    out.write(reinterpret_cast<const char*>(shape), sizeof(shape));
+    out.write(reinterpret_cast<const char*>(&dtype), sizeof(dtype));
+    out.write(reinterpret_cast<const char*>(host.data()),
+              static_cast<std::streamsize>(size));
+}
+
 namespace {
 
 void require_dflash_state(const PrefillContext& state) {
@@ -220,7 +262,8 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
             } else {
                 ops::kv_cache_append_prefix(
                     key_batch, value_batch, position_batch, commit_counts, table_rows, envelope,
-                    dflash_state(state).full_batch_layer(0), state.execution.device.stream);
+                    dflash_state(state).full_batch_layer(static_cast<std::uint32_t>(layer)),
+                    state.execution.device.stream);
             }
         }
     }
@@ -238,6 +281,9 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
         // The first-generation draft (MMFlash) has no convolution, no candidate
         // selector and a full rather than sliding attention window.
         const bool first_generation = state.execution.model.dflash->first_generation;
+        static bool traced = false;
+        const bool trace = first_generation && !traced && MMFlashTrace::enabled();
+        if (trace) { traced = true; }
         Tensor anchors             = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers           = frame.execution_frontiers.slice(0, 0, batch_size);
         Tensor valid_columns       = frame.target_valid_columns.slice(0, 0, batch_size);
@@ -253,6 +299,11 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
         Tensor residual = state.execution.work.alloc(DType::BF16, {Config::hidden, columns});
         ops::embedding(ids.view({columns}), state.execution.model.token_embedding, residual,
                        state.execution.device.stream);
+        if (trace) {
+            MMFlashTrace::write("proposal_ids", ids, state.execution.device.stream);
+            MMFlashTrace::write("proposal_positions", positions, state.execution.device.stream);
+            MMFlashTrace::write("block_embedding", residual, state.execution.device.stream);
+        }
 
         for (int layer = 0; layer < Config::layers; ++layer) {
             const auto& weight =
@@ -302,10 +353,13 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                     {Config::head_dim, Config::query_heads, width, batch_size});
                 if (first_generation) {
                     // The first-generation draft attends over the whole context and
-                    // over every row of the block; it has no sliding window.
+                    // over every row of the block; it has no sliding window.  Each
+                    // of its layers projects the context with its own key and value
+                    // weights, so each reads its own context cache.
                     ops::bidirectional_gqa_attention(
                         query_batch, key_batch, value_batch, frontiers, valid_columns, full_rows,
-                        Config::attention_scale, dflash_state(state).full_batch_layer(0),
+                        Config::attention_scale,
+                        dflash_state(state).full_batch_layer(static_cast<std::uint32_t>(layer)),
                         envelopes.full, state.execution.work, attention_batch,
                         state.execution.device.stream);
                 } else if (layer < Config::local_layers) {
@@ -378,6 +432,9 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
             DType::BF16, {Config::hidden, static_cast<std::int32_t>(k) * batch_size});
         ops::rmsnorm(packed, state.execution.model.dflash->final_norm, Config::rms_epsilon, false,
                      proposal_hidden, state.execution.device.stream);
+        if (trace) {
+            MMFlashTrace::write("draft_hidden", proposal_hidden, state.execution.device.stream);
+        }
         // DFlash2's selector codebooks are indexed by tokenizer IDs. In TP2, retain the exact
         // full-vocabulary candidate set while avoiding a full-vocabulary peer transfer: each rank
         // produces its local top-16 ordered keys and rank 0 merges the two 16-entry lists.
@@ -402,7 +459,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 // the same contiguous layout.
                 Tensor value = values.view({selector_columns});
                 Tensor index = indices.view({selector_columns});
-                ops::argmax_with_value(logits, value, index, TextConfig::output_rows,
+                ops::argmax_with_value(logits, value, index, TextConfig::token_domain,
                                         state.execution.device.stream);
                 Tensor gathered_values = state.execution.work.alloc(DType::FP32, {1, selector_columns});
                 Tensor gathered_indices = state.execution.work.alloc(DType::I32, {1, selector_columns});
@@ -429,7 +486,13 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
             Tensor indices0 = state.execution.work.alloc(DType::I32, {1, selector_columns});
             Tensor value0 = values0.view({selector_columns});
             Tensor index0 = indices0.view({selector_columns});
-            ops::argmax_with_value(part0, value0, index0, shard_rows,
+            // The first shard is entirely inside the tokenizer's domain; the
+            // last one holds the rows between the shard boundary and the
+            // domain, and nothing above it.
+            const std::int32_t valid0 = std::min(shard_rows, TextConfig::token_domain);
+            const std::int32_t valid1 =
+                std::min(shard_rows, TextConfig::token_domain - shard_rows);
+            ops::argmax_with_value(part0, value0, index0, valid0,
                                     state.execution.device.stream);
             Tensor values1 = state.execution.peers[0].work->alloc(DType::FP32, {1, selector_columns});
             Tensor indices1 = state.execution.peers[0].work->alloc(DType::I32, {1, selector_columns});
@@ -438,17 +501,22 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 CUDA_CHECK(cudaSetDevice(state.execution.peers[0].device->device));
                 Tensor value1 = values1.view({selector_columns});
                 Tensor index1 = indices1.view({selector_columns});
-                ops::argmax_with_value(part1, value1, index1, shard_rows,
+                ops::argmax_with_value(part1, value1, index1, valid1,
                                         state.execution.peers[0].device->stream);
             }
             Tensor gathered_values = state.execution.work.alloc(DType::FP32, {2, selector_columns});
             Tensor gathered_indices = state.execution.work.alloc(DType::I32, {2, selector_columns});
+            Tensor merged_peer_tokens =
+                state.execution.peers[0].work->alloc(DType::I32, {selector_columns});
             ops::allreduce_argmax(
                 std::array<Tensor, 2>{values0, values1},
                 std::array<Tensor, 2>{indices0, indices1},
-                std::array<Tensor, 1>{drafts.view({selector_columns})}, gathered_values,
-                gathered_indices, shard_rows, *state.execution.peers[0].execution,
-                *state.execution.peers[0].events);
+                std::array<Tensor, 2>{drafts.view({selector_columns}), merged_peer_tokens},
+                gathered_values, gathered_indices, shard_rows,
+                *state.execution.peers[0].execution, *state.execution.peers[0].events);
+            if (trace) {
+                MMFlashTrace::write("draft_tokens", drafts, state.execution.device.stream);
+            }
             state.execution.work.reset();
             return;
         }

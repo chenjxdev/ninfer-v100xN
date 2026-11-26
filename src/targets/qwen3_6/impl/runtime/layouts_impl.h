@@ -27,6 +27,21 @@
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
+
+// The planes of the paged full-context cache: one K plane and one V plane
+// per draft layer that attends over the whole context.
+template <class Config>
+std::vector<PagedKVPlaneSpec> full_context_planes() {
+    std::vector<PagedKVPlaneSpec> planes;
+    planes.reserve(static_cast<std::size_t>(Config::layers) * 2);
+    for (int layer = 0; layer < Config::layers; ++layer) {
+        planes.push_back(
+            PagedKVPlaneSpec{DType::BF16, Config::head_dim, Config::kv_heads, 256});
+        planes.push_back(
+            PagedKVPlaneSpec{DType::BF16, Config::head_dim, Config::kv_heads, 256});
+    }
+    return planes;
+}
 namespace {
 
 constexpr std::size_t kMiB        = 1024ULL * 1024ULL;
@@ -184,20 +199,22 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             // is planned for every DFlash draft now and the draft generation
             // picks which of the two it uses.
             if constexpr (DFlashConfig::local_layers <= DFlashConfig::layers) {
+                // A paged cache layer owns one K plane and one V plane, so a
+                // cache with one layer per draft layer needs two planes each.
                 PagedKVPoolSpec full_pool{
                     .page_group_count      = physical_pages,
                     .logical_page_capacity = logical_pages,
                     .table_rows            = static_cast<std::int32_t>(plan.max_concurrency),
                     .plane_order           = PagedKVPlaneOrder::HeadMajor,
-                    .planes =
-                        {
-                            {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
-                            {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
-                        },
+                    .planes = full_context_planes<DFlashConfig>(),
                 };
                 dflash.full.emplace(qwen3_6::PagedKVCacheLayout{
                     .pool        = plan_paged_kv_pool(builder, full_pool),
-                    .layers      = 1,
+                    // Every draft layer that attends over the whole context keeps
+                    // its own context K/V, so the cache has one layer per such
+                    // layer.  DFlash2 uses one; the first-generation draft uses
+                    // all of them.
+                    .layers      = DFlashConfig::layers,
                     .max_context = plan.capacity,
                     .kv_heads    = DFlashConfig::kv_heads,
                     .head_dim    = DFlashConfig::head_dim,

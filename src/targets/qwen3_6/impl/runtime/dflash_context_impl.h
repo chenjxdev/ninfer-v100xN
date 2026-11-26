@@ -26,8 +26,12 @@ DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
         local.lane_capacity() != rewrite_checkpoint_local.lane_capacity()) {
         throw std::invalid_argument("DFlash persistent cache layout is invalid");
     }
-    if (full && (full->layers() != 1 || full->max_context() != layout.full->max_context ||
-                 full->pool().plane_count() != 2 ||
+    // A cache layer owns one K plane and one V plane, so the pool holds two
+    // planes for every layer the cache has.
+    if (full && (full->layers() != DFlashConfig::layers ||
+                 full->max_context() != layout.full->max_context ||
+                 full->pool().plane_count() !=
+                     static_cast<std::size_t>(DFlashConfig::layers) * 2 ||
                  local.lane_capacity() != full->pool().table_row_count() ||
                  full->pool().plane(0).dtype != DType::BF16 ||
                  full->pool().plane(0).ne[0] != DFlashConfig::head_dim ||
