@@ -170,14 +170,16 @@ void host_vision_pos_embed(std::vector<float>& values, std::span<const float> ta
 
 void host_vision_rope(std::vector<float>& qkv, std::span<const std::int32_t> positions,
                       int heads, int head_dim) {
-    require(heads == 16 && head_dim == 72, "CPU Vision requires 16 heads of dimension 72");
+    require(heads > 0 && head_dim > 0 && head_dim % 4 == 0,
+            "CPU Vision RoPE requires positive heads and head_dim divisible by four");
     const int hidden = heads * head_dim;
     const int tokens = token_count(qkv.size(), 3 * hidden);
     require(positions.size() == std::size_t(tokens) * 2, "CPU Vision RoPE position mismatch");
     for (int token = 0; token < tokens; ++token) {
+        const int section = head_dim / 4;
         for (int pair = 0; pair < head_dim / 2; ++pair) {
-            const float frequency = std::pow(10000.0F, -static_cast<float>(pair % 18) / 18);
-            const float angle = positions[std::size_t(pair / 18) * tokens + token] * frequency;
+            const float frequency = std::pow(10000.0F, -static_cast<float>(pair % section) / section);
+            const float angle = positions[std::size_t(pair / section) * tokens + token] * frequency;
             const float cosine = std::cos(angle), sine = std::sin(angle);
             for (int plane = 0; plane < 2; ++plane) {
                 for (int head = 0; head < heads; ++head) {

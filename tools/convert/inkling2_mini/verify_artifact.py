@@ -14,7 +14,7 @@ import torch
 
 sys.path.insert(0, "/home/chenjx/ninfer-jack")
 from tools.artifact.container import Artifact
-from tools.artifact.layouts import decode_nvfp4_words
+from tools.artifact.layouts import decode_fp8_row_scaled_words, decode_nvfp4_words
 from tools.convert.common.safetensors import ShardReader
 
 SRC = "/data/models/Inkling-2-Mini-Abliterated-NVFP4"
@@ -88,22 +88,47 @@ def main():
             same = payload == source.contiguous().view(torch.uint16).numpy().tobytes()
             print("  %-46s -> %-28s 逐字节相同=%s" % (name, obj_name, same))
 
-        print("\n=== MXFP8 层（20-23）的专家：BF16 反量化是否等于源 ===")
+        print("\n=== Inkling 特定布局：relative-bias 转置 / static taps 反转 ===")
+        for name, obj_name, transformed in (
+            ("model.llm.layers.0.attn.rel_logits_proj.proj", "text/layers/0/attn/rel_proj",
+             reader.get("model.llm.layers.0.attn.rel_logits_proj.proj").T.contiguous()),
+            ("model.llm.layers.5.attn.k_sconv.static_w", "text/layers/5/attn/k_sconv_static",
+             reader.get("model.llm.layers.5.attn.k_sconv.static_w").flip(0).contiguous()),
+        ):
+            same = art.payload(obj_name) == transformed.view(torch.uint16).numpy().tobytes()
+            print("  %-46s -> %-28s 语义布局相同=%s" % (name, obj_name, same))
+            if not same:
+                raise AssertionError(obj_name + " has incorrect Inkling-specific layout")
+
+        print("\n=== MXFP8 层（20-23）：原始 codes 和 group scales 是否与源完全一致 ===")
         layer, expert = 23, 42
         prefix = "model.llm.layers.%d.mlp.experts" % layer
         for which, cols in (("w13", 2304), ("w2", 1152)):
             name = "text/layers/%d/mlp/experts/%d/%s" % (layer, expert, which)
-            payload = torch.frombuffer(bytearray(art.payload(name)), dtype=torch.uint16).view(torch.bfloat16).float().numpy()
-            weight = reader.get("%s.%s_weight" % (prefix, which))[expert].float().numpy()
-            scale = reader.get("%s.%s_weight_scale" % (prefix, which))[expert].numpy().astype(np.int32)
-            mult = np.ldexp(np.ones_like(scale, dtype=np.float32), scale - 127)
-            blocks = weight.reshape(weight.shape[0], weight.shape[1] // 32, 32) * mult.reshape(
-                weight.shape[0], weight.shape[1] // 32, 1)
-            source_values = blocks.reshape(weight.shape).reshape(2304, cols)
-            delta = np.abs(payload.reshape(2304, cols) - source_values).max()
-            print("  layer %d expert %d %-4s 最大误差 %.3g" % (layer, expert, which, delta))
+            codes, _ = decode_fp8_row_scaled_words(art.payload(name), (2304, cols))
+            artifact_codes = codes.numpy()
+            group_scales = torch.frombuffer(
+                bytearray(art.payload(name + "_mxscale")), dtype=torch.uint16
+            ).view(torch.bfloat16).float().numpy().reshape(2304, cols // 32)
+            artifact_values = e4m3(artifact_codes).reshape(2304, cols) * np.repeat(group_scales, 32, axis=1)
+
+            source_codes = reader.get("%s.%s_weight" % (prefix, which))[expert].view(torch.uint8).numpy()
+            source_ue8m0 = reader.get("%s.%s_weight_scale" % (prefix, which))[expert].numpy().astype(np.int32)
+            source_scales = np.ldexp(np.ones_like(source_ue8m0, dtype=np.float32), source_ue8m0 - 127)
+            source_values = e4m3(source_codes).reshape(2304, cols) * np.repeat(
+                source_scales.reshape(2304, cols // 32), 32, axis=1)
+            delta = np.abs(artifact_values - source_values).max()
+            exact = np.array_equal(artifact_values, source_values)
+            print("  layer %d expert %d %-4s 最大误差 %.3g 完全相同=%s" % (layer, expert, which, delta, exact))
+            if not exact:
+                raise AssertionError(name + " MXFP8 payload differs from source")
     finally:
-        art.close()
+        # NumPy/PyTorch can retain exported mmap views until garbage collection;
+        # process teardown closes the mapping and must not mask verification results.
+        try:
+            art.close()
+        except BufferError:
+            pass
         reader.close()
 
 

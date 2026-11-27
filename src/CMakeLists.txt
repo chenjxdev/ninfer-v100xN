@@ -89,7 +89,15 @@ add_library(ninfer_ops STATIC
   ops/launcher/gqa_attention_prefill.cu
   ops/launcher/kv_cache_append_prefix.cu
   ops/launcher/kv_retrieval.cu
+  ops/launcher/inkling_attention_dense.cu
+  ops/launcher/inkling_conv1d.cu
+  ops/launcher/inkling_depth_mix.cu
+  ops/launcher/inkling_loop_control.cu
+  ops/launcher/inkling_moe.cu
+  ops/launcher/inkling_pointwise.cu
+  ops/launcher/inkling_router.cu
   ops/launcher/l2norm.cu
+  ops/launcher/l2_clip.cu
   ops/launcher/layer_norm.cu
   ops/launcher/mtp_pack.cu
   ops/launcher/mtp_round.cu
@@ -105,6 +113,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/scatter.cu
   ops/launcher/sigmoid_gate_mul.cu
   ops/launcher/silu_and_mul.cu
+  ops/launcher/situ_mul.cu
   ops/launcher/vision_attention.cu
   ops/launcher/vision_pos_embed.cu
   # Gated DeltaNet Linear Attention core.
@@ -257,7 +266,15 @@ add_library(ninfer_ops STATIC
   ops/wrapper/gqa_attention.cpp
   ops/wrapper/kv_cache_append_prefix.cpp
   ops/wrapper/attn_input_proj.cpp
+  ops/wrapper/inkling_attention_dense.cpp
+  ops/wrapper/inkling_conv1d.cpp
+  ops/wrapper/inkling_depth_mix.cpp
+  ops/wrapper/inkling_loop_control.cpp
+  ops/wrapper/inkling_moe.cpp
+  ops/wrapper/inkling_pointwise.cpp
+  ops/wrapper/inkling_router.cpp
   ops/wrapper/l2norm.cpp
+  ops/wrapper/l2_clip.cpp
   ops/wrapper/layer_norm.cpp
   ops/wrapper/linear_add.cpp
   ops/wrapper/linear_pair.cpp
@@ -276,6 +293,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/scatter.cpp
   ops/wrapper/sigmoid_mul.cpp
   ops/wrapper/silu_mul.cpp
+  ops/wrapper/situ_mul.cpp
   ops/wrapper/sparse_moe.cpp
   ops/wrapper/vision_attention.cpp
   ops/wrapper/vision_pos_embed.cpp)
@@ -399,6 +417,7 @@ target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
 add_subdirectory(targets/qwen3_6)
 add_subdirectory(targets/qwen3_6_27b)
 add_subdirectory(targets/qwen3_6_35b_a3b)
+add_subdirectory(targets/inkling2_mini)
 
 target_link_libraries(ninfer_engine
   PRIVATE

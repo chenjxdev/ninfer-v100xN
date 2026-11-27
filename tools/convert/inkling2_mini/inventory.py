@@ -11,9 +11,10 @@ object. Splitting the experts per expert keeps that multiplier exact: each
 object stores its own divisor instead of folding it into the E4M3 block
 scales, which would have cost precision.
 
-The four MXFP8 expert layers (20-23) have no matching artifact format: the
-artifact vocabulary has no UE8M0 block-scale layout. They are stored as BF16,
-which is exact for the UE8M0 scales but costs 4 GB over the packed form.
+The four MXFP8 expert layers (20-23) keep their original FP8 codes in the
+existing row-scaled-FP8 container layout. A companion BF16 object per expert
+matrix stores the exact power-of-two scale for every 32-value group, avoiding
+both dequantization to BF16 and any requantization error.
 """
 
 from __future__ import annotations
@@ -44,6 +45,8 @@ RESOURCE_SPECS = tuple(ResourceSpec(name) for name in RESOURCE_SOURCES)
 # formats.
 NVFP4 = "NVFP4"
 BLOCK_SCALE_LAYOUT = "blockscale-k16-m128x4-v1"
+FP8_ROW_SCALED = "FP8_E4M3FN_ROW_BF16S"
+ROW_SCALE_LAYOUT = "row-scale-v1"
 
 MODEL_ID = "inkling2-mini"
 WEIGHTS_ID = "nvfp4"
@@ -170,8 +173,12 @@ def text_specs() -> list[TensorSpec]:
         for expert in range(N_EXPERT):
             base = "%s/mlp/experts/%d" % (prefix, expert)
             if plan.mxfp8_experts:
-                specs.append(_spec(base + "/w13", (HIDDEN, 2 * EXPERT_HIDDEN), BF16))
-                specs.append(_spec(base + "/w2", (HIDDEN, EXPERT_HIDDEN), BF16))
+                specs.append(_spec(base + "/w13", (HIDDEN, 2 * EXPERT_HIDDEN),
+                                   FP8_ROW_SCALED, ROW_SCALE_LAYOUT))
+                specs.append(_spec(base + "/w2", (HIDDEN, EXPERT_HIDDEN),
+                                   FP8_ROW_SCALED, ROW_SCALE_LAYOUT))
+                specs.append(_spec(base + "/w13_mxscale", (HIDDEN, EXPERT_HIDDEN // 16), BF16))
+                specs.append(_spec(base + "/w2_mxscale", (HIDDEN, EXPERT_HIDDEN // 32), BF16))
             else:
                 specs.append(_nvfp4_spec(base + "/w13", (HIDDEN, 2 * EXPERT_HIDDEN)))
                 specs.append(_nvfp4_spec(base + "/w2", (HIDDEN, EXPERT_HIDDEN)))
@@ -225,8 +232,9 @@ def validate_inventory() -> None:
         raise ValueError("Inkling-2-Mini inventory is empty")
     experts = sum(
         1 for name in names if "/mlp/experts/" in name)
-    if experts != LAYERS * N_EXPERT * 2:
+    expected_experts = (LAYERS + len(MXFP8_LAYERS)) * N_EXPERT * 2
+    if experts != expected_experts:
         raise ValueError(
             f"Inkling-2-Mini inventory has {experts} expert objects, "
-            f"expected {LAYERS * N_EXPERT * 2}"
+            f"expected {expected_experts}"
         )

@@ -24,7 +24,7 @@ from tools.artifact.container import (
     ArtifactWriter,
     ResourceSpec as ArtifactResourceSpec,
 )
-from tools.artifact.layouts import encode_nvfp4
+from tools.artifact.layouts import encode_fp8_row_scaled, encode_nvfp4
 from tools.convert.common.safetensors import ShardReader
 from tools.convert.qwen3_6.common import conversion as family_conversion
 
@@ -164,6 +164,14 @@ def build_payload(object_name: str, spec, reader: ShardReader, plan, expert_cach
         _, _, layer_text, _, _, expert_text, which = object_name.split("/")
         expert = int(expert_text)
         prefix = "model.llm.layers.%d.mlp.experts" % int(layer_text)
+        if which.endswith("_mxscale"):
+            base_which = which[:-len("_mxscale")]
+            consumed.add(prefix + ".%s_weight" % base_which)
+            scales = expert_cache.setdefault(
+                (plan.index, which), reader.get(prefix + ".%s_weight_scale" % base_which))[expert]
+            exponent = scales.to(torch.int32) - 127
+            multipliers = torch.ldexp(torch.ones_like(exponent, dtype=torch.float32), exponent)
+            return multipliers.to(torch.bfloat16).contiguous().view(torch.uint16).numpy().tobytes()
         for suffix in ("%s_weight" % which, "%s_weight_scale" % which,
                        "%s_weight_amax" % which,
                        "%s_weight_outer_scale_denominator" % which):
@@ -171,12 +179,11 @@ def build_payload(object_name: str, spec, reader: ShardReader, plan, expert_cach
         if plan.mxfp8_experts:
             weights = expert_cache.setdefault(
                 (plan.index, which), reader.get(prefix + ".%s_weight" % which))
-            scales = expert_cache.setdefault(
-                (plan.index, which + "s"), reader.get(prefix + ".%s_weight_scale" % which))
-            dequantized = dequantize_mxfp8(weights[expert], scales[expert])
-            tensor = dequantized.reshape(inv.HIDDEN, 2 * inv.EXPERT_HIDDEN) if which == "w13" \
-                else dequantized.reshape(inv.HIDDEN, inv.EXPERT_HIDDEN)
-            return tensor.contiguous().view(torch.uint16).numpy().tobytes()
+            shape = (inv.HIDDEN, 2 * inv.EXPERT_HIDDEN) if which == "w13" \
+                else (inv.HIDDEN, inv.EXPERT_HIDDEN)
+            codes = weights[expert].view(torch.uint8).reshape(shape)
+            return encode_fp8_row_scaled(
+                codes.contiguous(), torch.ones(shape[0], dtype=torch.bfloat16), shape)
         packed = expert_cache.setdefault(
             (plan.index, which), reader.get(prefix + ".%s_weight" % which))[expert]
         scales = expert_cache.setdefault(
@@ -202,6 +209,11 @@ def build_payload(object_name: str, spec, reader: ShardReader, plan, expert_cach
         raise ValueError(f"no source tensor for {object_name}")
     consumed.add(name)
     tensor = reader.get(name)
+    # Match llama.cpp's GGUF tensor semantics while retaining NInfer's internal descriptors.
+    if object_name.endswith("/attn/rel_proj"):
+        tensor = tensor.T.contiguous()
+    elif object_name.endswith(("/attn/k_sconv_static", "/attn/v_sconv_static")):
+        tensor = tensor.flip(0).contiguous()
     if tensor.dtype == torch.bfloat16:
         return tensor.contiguous().view(torch.uint16).numpy().tobytes()
     if tensor.dtype == torch.float32:
@@ -260,7 +272,7 @@ def convert(model_dir: str | Path, out_path: str | Path) -> Path:
     print(f"complete: {output.stat().st_size} bytes in {elapsed:.1f}s")
     report = Path(str(output) + ".conversion.json")
     report.write_text(json.dumps({
-        "recipe_id": "inkling2_mini-nvfp4-v1",
+        "recipe_id": "inkling2_mini-nvfp4-v3",
         "source": {
             "repository": "aday777/Inkling-2-Mini-Abliterated-NVFP4",
             "revision": "40bf42fdff1dc2d619ea01d564f1597363216ebb",
@@ -270,9 +282,10 @@ def convert(model_dir: str | Path, out_path: str | Path) -> Path:
         "bytes": output.stat().st_size,
         "elapsed_seconds": elapsed,
         "notes": [
-            "The four MXFP8 expert layers (20-23) are stored as BF16: the artifact "
-            "has no UE8M0 block-scale layout, so dequantizing is the exact option "
-            "and costs about 4 GB over the packed form.",
+            "The four MXFP8 expert layers (20-23) preserve their original FP8 codes. "
+            "Each expert matrix has a companion BF16 object containing the exact "
+            "power-of-two scale for every 32-value group; no dequantization or "
+            "requantization is performed.",
         ],
     }, indent=2) + "\n", encoding="utf-8")
     print(f"report={report}")

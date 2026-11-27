@@ -78,6 +78,24 @@ ninfer_add_test(ninfer_artifact_reader_test
 ninfer_add_test(ninfer_artifact_materialization_test
   SOURCES test_artifact_materialization.cpp
   LIBRARIES ninfer_artifact)
+# Host-only physical-weight/logical-state mapping for the three-pass middle cycle.
+ninfer_add_test(ninfer_inkling2_mini_topology_test
+  SOURCES targets/inkling2_mini/test_topology.cpp)
+ninfer_add_test(ninfer_inkling2_mini_load_plan_test
+  SOURCES targets/inkling2_mini/test_load_plan.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_inkling2_mini_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_inkling2_mini_shard_test
+  SOURCES targets/inkling2_mini/test_shard_plan.cpp
+  LIBRARIES ninfer_engine)
+ninfer_add_test(ninfer_inkling2_mini_tp2_materialization_test
+  SOURCES targets/inkling2_mini/test_tp2_materialization.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_inkling2_mini_tp2_materialization_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_inkling2_mini_runtime_kernels_test
+  SOURCES targets/inkling2_mini/test_runtime_kernels.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_inkling2_mini_runtime_kernels_test PROPERTIES SKIP_RETURN_CODE 77)
 # Host-only: no artifact, no device. Byte-level TP2 shard slice geometry per storage layout.
 ninfer_add_test(ninfer_tensor_slice_test
   SOURCES test_tensor_slice.cpp
@@ -353,13 +371,22 @@ set(ninfer_op_tests
   add_bias
   gelu
   silu_mul
+  situ_mul
   residual_add
   sigmoid_mul
   rmsnorm
   gated_rmsnorm
   l2norm
+  l2_clip
   gated_delta_net
   causal_conv1d_silu
+  inkling_attention_dense
+  inkling_conv1d
+  inkling_depth_mix
+  inkling_loop_control
+  inkling_moe
+  inkling_pointwise
+  inkling_router
   layer_norm
   embedding
   argmax
